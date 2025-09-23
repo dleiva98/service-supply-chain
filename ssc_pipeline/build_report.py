@@ -346,55 +346,97 @@ def partner_name_series(x, fallback):
 
 def partner_deep_dive(df, source_name, title, top=5, with_ai=False):
     m = df[df["source"].eq(source_name)].copy()
-    if m.empty: return "", "<p><em>(no data)</em></p>"
+    if m.empty:
+        return "", "<p><em>(no data)</em></p>"
+
     v = choose_numcol(m, ("ALL_VAL_MO","Value","value"))
-    if not v: return "", "<p><em>(no data)</em></p>"
+    if not v:
+        return "", "<p><em>(no data)</em></p>"
+
+    # Month key
     m["ym"] = to_ym(m["time"])
-    # human partner labels
+
+    # Human partner labels
     if "partner_name" in m.columns and m["partner_name"].notna().any():
         m["partner_label"] = m["partner_name"].astype(str)
     else:
-        m["partner_label"] = m["partner"].apply(lambda c: partner_name_series(c, str(c)))
+        m["partner_label"] = m["partner"].apply(lambda c: PARTNER_NAME.get(str(c).upper(), str(c)))
+
+    # Pick top partners by last 12 months sum
     last12 = m[m["ym"] >= (m["ym"].max() - 11)]
+    if last12.empty:
+        return "", "<p><em>(no data in last 12 months)</em></p>"
+
     top_partners = (last12.groupby("partner_label")[v].sum()
                     .sort_values(ascending=False).head(top).index.tolist())
+
     mm = m[m["partner_label"].isin(top_partners)]
     g = mm.groupby(["partner_label","ym"])[v].sum().reset_index()
 
+    # Line chart for top partners
     fig, ax = plt.subplots(figsize=(8.2,4.6))
     for p, sub in g.groupby("partner_label"):
         sub = sub.sort_values("ym")
         ax.plot(sub["ym"].dt.to_timestamp(), sub[v], marker="o", label=str(p))
     ax.set_title(title + " — Top Partners (last 12m leaders)")
-    ax.set_xlabel("Month"); ax.set_ylabel("Value"); ax.grid(True, alpha=.3); ax.legend(ncol=2, fontsize=9)
+    ax.set_xlabel("Month"); ax.set_ylabel("Value")
+    ax.grid(True, alpha=.3); ax.legend(ncol=2, fontsize=9)
     img = img64(fig)
 
+    # YoY table for latest month vs same month prev year
     latest = m["ym"].max()
     this = m[m["ym"].eq(latest)].groupby("partner_label")[v].sum()
-    prev = m[m["ym"].eq(latest - 12)].groupby("partner_label")[v].sum() if (latest - 12) in m["ym"].unique() else pd.Series(dtype=float)
-    yoy = pd.DataFrame({"Latest": this, "PrevYear": prev}).reset_index()
-    yoy["YoY%"] = 100.0*((yoy["Latest"]/yoy["PrevYear"]) - 1.0)
+    prev = m[m["ym"].eq(latest - 12)].groupby("partner_label")[v].sum()
+
+    # Make sure index has the right name so reset_index creates 'partner_label'
+    this = this.rename("Latest")
+    prev = prev.rename("PrevYear")
+    # Align by index and keep partners present in either series
+    yoy = pd.concat([this, prev], axis=1)
+    yoy.index.name = "partner_label"
+    yoy = yoy.reset_index()
+
+    # Compute YoY% safely
+    yoy["YoY%"] = np.where(
+        yoy["PrevYear"].fillna(0) != 0,
+        100.0 * ((yoy["Latest"] / yoy["PrevYear"]) - 1.0),
+        np.nan
+    )
     yoy = yoy.sort_values("Latest", ascending=False)
 
-    shares = last12.groupby("partner_label")[v].sum()
+    # Concentration (HHI) over last 12 months (for displayed partners)
+    shares = last12[last12["partner_label"].isin(top_partners)].groupby("partner_label")[v].sum()
     hhi = None
-    if shares.sum()>0:
+    if shares.sum() > 0:
         s = shares / shares.sum()
-        hhi = float((s.pow(2).sum())*10000)
-    expl = "<p class='note'>Concentration index (HHI, last 12m): " + (f"{hhi:,.0f}" if hhi is not None else "n/a") + \
-           " &nbsp; · &nbsp; Rule of thumb: ≥2500 = high concentration.</p>"
+        hhi = float((s.pow(2).sum()) * 10000)
 
-    html_table = table_html(yoy, cols=["partner_label","Latest","PrevYear","YoY%"])
+    expl = (
+        "<p class='note'>Concentration index (HHI, last 12m): "
+        + (f"{hhi:,.0f}" if hhi is not None else "n/a")
+        + " &nbsp; · &nbsp; Rule of thumb: ≥2500 = high concentration.</p>"
+    )
+
+    html_table = table_html(
+        yoy.assign(
+            Latest=yoy["Latest"].apply(human),
+            PrevYear=yoy["PrevYear"].apply(lambda x: "" if pd.isna(x) else human(x)),
+            **{"YoY%": yoy["YoY%"].apply(lambda x: "" if pd.isna(x) else f"{x:.1f}%")}
+        ),
+        cols=["partner_label","Latest","PrevYear","YoY%"]
+    )
+
     if with_ai:
         ctx = {
-            "top_partners": yoy["partner_label"].head(5).tolist(),
-            "latest_top": human(yoy["Latest"].head(1).values[0]) if len(yoy)>0 else None,
+            "top_partners": yoy["partner_label"].head(5).tolist() if "partner_label" in yoy.columns else [],
+            "latest_top": human(yoy["Latest"].head(1).values[0]) if not yoy.empty else None,
             "hhi": hhi
         }
         narr = ai_narrative(title, ctx)
         return img, "<pre>"+narr+"</pre>" + expl + html_table
     else:
         return img, expl + html_table
+
 
 # ====================== Build report ======================
 def build_report():
