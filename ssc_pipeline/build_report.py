@@ -3,7 +3,7 @@ import os, sys, io, base64, pathlib, datetime as dt
 import numpy as np
 import pandas as pd
 
-# Headless plotting (CI)
+# Headless plotting for CI
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -25,6 +25,7 @@ PARTNER_NAME = {
     "ARG":"Argentina", "CHL":"Chile", "PER":"Peru", "COL":"Colombia",
 }
 
+# ====================== Utilities ======================
 def human(x):
     try:
         x = float(x)
@@ -52,6 +53,7 @@ def choose_numcol(df, candidates=("Value","value","ALL_VAL_MO")):
     return None
 
 def safe_year(s):   return pd.to_numeric(s.astype(str).str[:4], errors="coerce")
+
 def to_ym(s):
     ss = s.astype(str)
     y = ss.str[:4]; m = ss.str[5:7].where(ss.str.len()>=7, "01")
@@ -68,7 +70,8 @@ def table_html(df, max_rows=12, cols=None):
 # ====================== Optional AI ======================
 def _gpt():
     key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not key: return None
+    if not key:
+        return None
     try:
         from openai import OpenAI
         return OpenAI(api_key=key)
@@ -81,16 +84,13 @@ def ai_narrative(title, context_dict, max_tokens=450):
         return f"({title}: AI commentary disabled — add OPENAI_API_KEY as a repository secret.)"
     try:
         sysmsg = "You are a senior supply-chain economist and data storyteller. Be concise, factual, executive."
-        prompt = f"""
-Write a short English narrative (2 short paragraphs + 3 bullets) for the chart titled "{title}".
-Use ONLY the context provided; do not fabricate numbers.
-
-Context:
-{context_dict}
-
-Explain acronyms inline (e.g., MFN, PPI). State what changed (YoY), the latest value in words,
-and what the next 3–6 months likely mean operationally. Keep it non-technical and public-facing.
-"""
+        prompt = (
+            f'Write a short English narrative (2 short paragraphs + 3 bullets) for the chart titled "{title}".\n'
+            "Use ONLY the context provided; do not fabricate numbers.\n\n"
+            f"Context:\n{context_dict}\n\n"
+            "Explain acronyms inline (e.g., MFN, PPI). State what changed (YoY), the latest value in words, "
+            "and what the next 3–6 months likely mean operationally. Keep it non-technical and public-facing."
+        )
         out = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role":"system","content":sysmsg},{"role":"user","content":prompt}],
@@ -102,6 +102,10 @@ and what the next 3–6 months likely mean operationally. Keep it non-technical 
 
 # ====================== Forecasting & metrics ======================
 def ets_forecast_with_bands(series: pd.Series, periods=12):
+    """
+    ETS/Holt-Winters with 95% band; safe fallback if statsmodels missing.
+    Returns (fc_df, band_df)
+    """
     s = series.dropna().astype(float)
     if len(s) < 6:
         return pd.DataFrame(columns=["date","yhat"]), pd.DataFrame(columns=["date","lower","upper"])
@@ -109,44 +113,62 @@ def ets_forecast_with_bands(series: pd.Series, periods=12):
         from statsmodels.tsa.holtwinters import ExponentialSmoothing
         seasonal = "add" if len(s) >= 24 else None
         m = 12 if seasonal else None
-        model = ExponentialSmoothing(s, trend="add", seasonal=seasonal,
-                                     seasonal_periods=m, initialization_method="estimated").fit(optimized=True)
+        model = ExponentialSmoothing(
+            s, trend="add", seasonal=seasonal, seasonal_periods=m, initialization_method="estimated"
+        ).fit(optimized=True)
         f = model.forecast(periods)
-        resid_sd = float(np.nanstd(getattr(model, "resid", s - model.fittedvalues), ddof=1))
-        dates = f.index.to_timestamp()
+        resid = getattr(model, "resid", s - model.fittedvalues)
+        resid_sd = float(np.nanstd(resid, ddof=1)) if len(resid) > 1 else float(np.nanstd(s))
+        dates = f.index.to_timestamp() if hasattr(f.index, "to_timestamp") else pd.to_datetime(f.index)
         fc   = pd.DataFrame({"date": dates, "yhat": f.values})
         band = pd.DataFrame({"date": dates,
-                             "lower": f.values-1.96*resid_sd, "upper": f.values+1.96*resid_sd})
+                             "lower": f.values - 1.96*resid_sd,
+                             "upper": f.values + 1.96*resid_sd})
         return fc, band
     except Exception:
-        # flat fallback
+        # Fallback: flat mean ± 1σ
         mean_val = float(pd.Series(s).tail(12).mean()) if len(s)>=12 else float(pd.Series(s).mean())
         std_val  = float(pd.Series(s).tail(12).std(ddof=1)) if len(s)>=12 else float(pd.Series(s).std(ddof=1))
-        start = s.index[-1].to_timestamp() if hasattr(s.index[-1],"to_timestamp") else pd.Timestamp(s.index[-1])
+        last = s.index[-1]
+        start = last.to_timestamp() if hasattr(last, "to_timestamp") else pd.Timestamp(last)
         dates = pd.date_range(start=start + pd.offsets.MonthBegin(1), periods=periods, freq="MS")
         fc   = pd.DataFrame({"date": dates, "yhat": [mean_val]*periods})
         band = pd.DataFrame({"date": dates, "lower": [mean_val-1.96*std_val]*periods,
                              "upper": [mean_val+1.96*std_val]*periods})
         return fc, band
 
-def backtest_last_12(series: pd.Series):
-    """One-shot backtest: train up to t-12, forecast 12, compare to actual 12."""
+def backtest_last_12_with_coverage(series: pd.Series):
+    """
+    One-shot backtest:
+      - train up to t-12, forecast 12 months
+      - build 95% band from residual std of training fit
+      - compute MAPE, sMAPE, RMSE, Coverage@95%
+    """
     s = series.dropna().astype(float)
     if len(s) < 24:
-        return {"MAPE": None, "sMAPE": None, "RMSE": None, "n": 0}
+        return {"MAPE": None, "sMAPE": None, "RMSE": None, "Coverage95": None, "n": 0}
+
     hist = s.iloc[:-12]
     true = s.iloc[-12:]
-    fc, _ = ets_forecast_with_bands(hist, periods=12)
-    if fc.empty: return {"MAPE": None, "sMAPE": None, "RMSE": None, "n": 0}
-    pred = pd.Series(fc["yhat"].values, index=true.index)
-    # metrics
-    eps = 1e-9
-    mape = float((np.abs((true - pred) / (true.replace(0, eps)))) .mean()) * 100.0
-    smape = float((np.abs(true - pred) / ((np.abs(true) + np.abs(pred)) / 2.0 + eps)).mean()) * 100.0
-    rmse = float(np.sqrt(((true - pred)**2).mean()))
-    return {"MAPE": mape, "sMAPE": smape, "RMSE": rmse, "n": len(true)}
+    fc, band = ets_forecast_with_bands(hist, periods=12)
+    if fc.empty:
+        return {"MAPE": None, "sMAPE": None, "RMSE": None, "Coverage95": None, "n": 0}
 
-# ====================== Styles ======================
+    pred = pd.Series(fc["yhat"].values, index=true.index)
+    if not band.empty:
+        lower = pd.Series(band["lower"].values, index=true.index)
+        upper = pd.Series(band["upper"].values, index=true.index)
+        coverage = float(((true >= lower) & (true <= upper)).mean()) * 100.0
+    else:
+        coverage = None
+
+    eps = 1e-9
+    mape  = float((np.abs((true - pred) / (true.replace(0, eps)))).mean()) * 100.0
+    smape = float((np.abs(true - pred) / ((np.abs(true) + np.abs(pred)) / 2.0 + eps)).mean()) * 100.0
+    rmse  = float(np.sqrt(((true - pred) ** 2).mean()))
+    return {"MAPE": mape, "sMAPE": smape, "RMSE": rmse, "Coverage95": coverage, "n": int(true.shape[0])}
+
+# ====================== Styles & sections ======================
 STYLE = """
 <style>
 body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; margin: 24px; }
@@ -167,7 +189,7 @@ img { max-width: 100%; height: auto; }
 """
 def section(title, body): return f"<div class='section'><h2>{title}</h2>{body}</div>"
 
-# ====================== Chart helpers (with AI narratives) ======================
+# ====================== Charts & narratives ======================
 def line_wits_trade(df):
     w = df[df["source"].eq("wits_trade")].copy()
     if w.empty: return "", "(no data)"
@@ -183,9 +205,11 @@ def line_wits_trade(df):
         sub = sub.dropna(subset=["year"]).sort_values("year")
         label = "Imports (MPRT)" if ind=="MPRT-TRD-VL" else "Exports (XPRT)"
         ax.plot(sub["year"], sub[v], marker="o", label=label)
+        last = sub[v].iloc[-1]
+        prev = sub[v].iloc[-2] if len(sub)>1 else None
         ctx[label] = {
-            "last": human(sub[v].iloc[-1]),
-            "yoy%": round(100.0*(sub[v].iloc[-1]/sub[v].iloc[-2]-1.0),1) if len(sub)>1 and sub[v].iloc[-2]!=0 else None
+            "last": human(last),
+            "yoy%": round(100.0*(last/prev-1.0),1) if prev not in (None,0) else None
         }
     ax.set_title("WITS — US Goods Trade with World (Annual)"); ax.set_xlabel("Year"); ax.set_ylabel("Value")
     ax.grid(True, alpha=.3); ax.legend()
@@ -208,10 +232,8 @@ def line_wits_tariffs(df):
         sub = sub.dropna(subset=["year"]).sort_values("year")
         label = "MFN Weighted Avg" if ind=="MFN-WGHTD-AVRG" else "MFN Simple Avg"
         ax.plot(sub["year"], sub[v], marker="o", label=label)
-        ctx[label] = {
-            "last_%": round(float(sub[v].iloc[-1]),2),
-            "yoy_pp": round(float(sub[v].iloc[-1] - sub[v].iloc[-2]),2) if len(sub)>1 else None
-        }
+        last = float(sub[v].iloc[-1]); prev = float(sub[v].iloc[-2]) if len(sub)>1 else None
+        ctx[label] = {"last_%": round(last,2), "yoy_pp": round(last - prev,2) if prev is not None else None}
     ax.set_title("WITS — MFN (Most-Favoured-Nation) Average Tariffs"); ax.set_xlabel("Year"); ax.set_ylabel("Percent")
     ax.grid(True, alpha=.3); ax.legend()
     img = img64(fig)
@@ -220,22 +242,23 @@ def line_wits_tariffs(df):
 
 def monthly_series(df, source_name, title):
     m = df[df["source"].eq(source_name)].copy()
-    if m.empty: return "", "", {}, pd.DataFrame(), pd.DataFrame()
+    if m.empty: return "", "", "", "", {}, pd.DataFrame(), pd.DataFrame()
     v = choose_numcol(m, ("ALL_VAL_MO","Value","value"))
-    if not v: return "", "", {}, pd.DataFrame(), pd.DataFrame()
+    if not v: return "", "", "", "", {}, pd.DataFrame(), pd.DataFrame()
     m["ym"] = to_ym(m["time"])
     g = m.groupby("ym")[v].sum().sort_index()
-    if g.empty: return "", "", {}, pd.DataFrame(), pd.DataFrame()
+    if g.empty: return "", "", "", "", {}, pd.DataFrame(), pd.DataFrame()
 
-    # history
+    # history chart
     fig, ax = plt.subplots(figsize=(7.8,4.4))
     ax.plot(g.index.to_timestamp(), g.values, marker="o")
     ax.set_title(title); ax.set_xlabel("Month"); ax.set_ylabel("Value"); ax.grid(True, alpha=.3)
-    img = img64(fig)
+    img_hist = img64(fig)
 
-    # forecast + bands + metrics
+    # forecast + bands + metrics (incl. coverage)
     fc, band = ets_forecast_with_bands(g)
-    metrics = backtest_last_12(g)
+    metrics = backtest_last_12_with_coverage(g)
+
     fig2, ax2 = plt.subplots(figsize=(7.8,4.4))
     ax2.plot(g.index.to_timestamp(), g.values, label="History")
     if not fc.empty:
@@ -246,39 +269,49 @@ def monthly_series(df, source_name, title):
     ax2.grid(True, alpha=.3); ax2.legend()
     img_fc = img64(fig2)
 
-    ctx = {
-        "last": human(g.values[-1]),
-        "yoy%": round(100.0*(g.values[-1]/g.values[-13]-1.0),1) if len(g)>=13 and g.values[-13]!=0 else None,
-        "fc_last": (human(fc["yhat"].iloc[-1]) if not fc.empty else None),
+    # AI narrative for HISTORY
+    ctx_hist = {
+        "last": (human(g.values[-1]) if len(g)>0 else None),
+        "yoy%": round(100.0*(g.values[-1]/g.values[-13]-1.0),1) if len(g)>=13 and g.values[-13]!=0 else None
+    }
+    hist_narrative = ai_narrative(title, ctx_hist)
+
+    # AI narrative for FORECAST (includes scores)
+    ctx_fc = {
+        "last_forecast_point": (human(fc["yhat"].iloc[-1]) if not fc.empty else None),
+        "band": "95% confidence band",
         "metrics": metrics
     }
-    narrative = ai_narrative(title, ctx)
-    return img, img_fc, "<pre>"+narrative+"</pre>", g.to_frame("value"), fc
+    fc_title = title + " — Forecast"
+    fc_narrative = ai_narrative(fc_title, ctx_fc)
+
+    return img_hist, img_fc, "<pre>"+hist_narrative+"</pre>", "<pre>"+fc_narrative+"</pre>", metrics, g.to_frame("value"), fc
 
 def ppi_series(df):
     b = df[df["source"].eq("bls_ppi")].copy()
-    if b.empty: return "", "", {}, pd.DataFrame(), pd.DataFrame()
+    if b.empty: return "", "", "", "", {}, pd.DataFrame(), pd.DataFrame()
     v = choose_numcol(b, ("value","Value"))
-    if not v: return "", "", {}, pd.DataFrame(), pd.DataFrame()
+    if not v: return "", "", "", "", {}, pd.DataFrame(), pd.DataFrame()
     try:
         b = b.dropna(subset=["year","period"])[["year","period",v]].copy()
         b["month"] = b["period"].astype(str).str.replace("M","", regex=False).astype(int)
         b["date"] = pd.to_datetime(dict(year=b["year"].astype(int), month=b["month"], day=1))
         s = b.set_index("date")[v].astype(float).sort_index()
     except Exception:
-        return "", "", {}, pd.DataFrame(), pd.DataFrame()
-    if s.empty: return "", "", {}, pd.DataFrame(), pd.DataFrame()
+        return "", "", "", "", {}, pd.DataFrame(), pd.DataFrame()
+    if s.empty: return "", "", "", "", {}, pd.DataFrame(), pd.DataFrame()
 
     # history
     fig, ax = plt.subplots(figsize=(7.8,4.4))
     ax.plot(s.index, s.values, marker="o")
     ax.set_title("BLS PPI — Producer Price Index (Upstream cost)"); ax.set_xlabel("Month"); ax.set_ylabel("Index")
     ax.grid(True, alpha=.3)
-    img = img64(fig)
+    img_hist = img64(fig)
 
-    # forecast + bands + metrics
+    # forecast + bands + metrics (incl. coverage)
     fc, band = ets_forecast_with_bands(s)
-    metrics = backtest_last_12(s)
+    metrics = backtest_last_12_with_coverage(s)
+
     fig2, ax2 = plt.subplots(figsize=(7.8,4.4))
     ax2.plot(s.index, s.values, label="History")
     if not fc.empty:
@@ -289,14 +322,21 @@ def ppi_series(df):
     ax2.grid(True, alpha=.3); ax2.legend()
     img_fc = img64(fig2)
 
-    ctx = {
-        "last_index": round(float(s.values[-1]), 1),
-        "yoy%": round(100.0*(s.values[-1]/s.values[-13]-1.0),1) if len(s)>=13 and s.values[-13]!=0 else None,
-        "fc_last": (round(float(fc['yhat'].iloc[-1]),1) if not fc.empty else None),
+    # AI narratives
+    ctx_hist = {
+        "last_index": round(float(s.values[-1]), 1) if len(s)>0 else None,
+        "yoy%": round(100.0*(s.values[-1]/s.values[-13]-1.0),1) if len(s)>=13 and s.values[-13]!=0 else None
+    }
+    hist_narrative = ai_narrative("BLS PPI (History)", ctx_hist)
+
+    ctx_fc = {
+        "last_forecast_point": (round(float(fc['yhat'].iloc[-1]),1) if not fc.empty else None),
+        "band": "95% confidence band",
         "metrics": metrics
     }
-    narrative = ai_narrative("BLS PPI", ctx)
-    return img, img_fc, "<pre>"+narrative+"</pre>", s.reset_index().rename(columns={v:"value"}), fc
+    fc_narrative = ai_narrative("BLS PPI — Forecast", ctx_fc)
+
+    return img_hist, img_fc, "<pre>"+hist_narrative+"</pre>", "<pre>"+fc_narrative+"</pre>", metrics, s.reset_index().rename(columns={v:"value"}), fc
 
 # ====================== Partner Deep Dive (names + HHI) ======================
 def partner_name_series(x, fallback):
@@ -304,7 +344,7 @@ def partner_name_series(x, fallback):
     x = str(x).upper()
     return PARTNER_NAME.get(x, fallback)
 
-def partner_deep_dive(df, source_name, title, top=5):
+def partner_deep_dive(df, source_name, title, top=5, with_ai=False):
     m = df[df["source"].eq(source_name)].copy()
     if m.empty: return "", "<p><em>(no data)</em></p>"
     v = choose_numcol(m, ("ALL_VAL_MO","Value","value"))
@@ -335,6 +375,7 @@ def partner_deep_dive(df, source_name, title, top=5):
     yoy = pd.DataFrame({"Latest": this, "PrevYear": prev}).reset_index()
     yoy["YoY%"] = 100.0*((yoy["Latest"]/yoy["PrevYear"]) - 1.0)
     yoy = yoy.sort_values("Latest", ascending=False)
+
     shares = last12.groupby("partner_label")[v].sum()
     hhi = None
     if shares.sum()>0:
@@ -342,9 +383,20 @@ def partner_deep_dive(df, source_name, title, top=5):
         hhi = float((s.pow(2).sum())*10000)
     expl = "<p class='note'>Concentration index (HHI, last 12m): " + (f"{hhi:,.0f}" if hhi is not None else "n/a") + \
            " &nbsp; · &nbsp; Rule of thumb: ≥2500 = high concentration.</p>"
-    return img, expl + table_html(yoy, cols=["partner_label","Latest","PrevYear","YoY%"])
 
-# ====================== Build ======================
+    html_table = table_html(yoy, cols=["partner_label","Latest","PrevYear","YoY%"])
+    if with_ai:
+        ctx = {
+            "top_partners": yoy["partner_label"].head(5).tolist(),
+            "latest_top": human(yoy["Latest"].head(1).values[0]) if len(yoy)>0 else None,
+            "hhi": hhi
+        }
+        narr = ai_narrative(title, ctx)
+        return img, "<pre>"+narr+"</pre>" + expl + html_table
+    else:
+        return img, expl + html_table
+
+# ====================== Build report ======================
 def build_report():
     pathlib.Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
     if not os.path.exists(CSV):
@@ -354,10 +406,11 @@ def build_report():
     df = pd.read_csv(CSV)
     pulled = df.get("pulled_at_utc", pd.Series(dtype=str)).dropna().astype(str).max() if "pulled_at_utc" in df.columns else ""
 
+    # Overview by source
     by_src = (df["source"].value_counts().rename_axis("source").reset_index(name="rows")
               if "source" in df.columns else pd.DataFrame(columns=["source","rows"]))
 
-    # KPI
+    # KPI cards
     kpi_html = f"""
     <div class="kpi">
       <div class="card"><small>Last pull</small><b>{pulled or 'N/A'}</b></div>
@@ -366,40 +419,65 @@ def build_report():
     </div>
     """
 
-    # Charts + AI narratives
+    # WITS Trade & Tariffs (history with AI narratives)
     trade_img,  trade_ai  = line_wits_trade(df)
     tariff_img, tariff_ai = line_wits_tariffs(df)
 
-    imp_img, imp_fc_img, imp_ai, imp_hist, imp_fc = monthly_series(df, "census_imports", "Census — Total Imports (Monthly)")
-    exp_img, exp_fc_img, exp_ai, exp_hist, exp_fc = monthly_series(df, "census_exports", "Census — Total Exports (Monthly)")
-    ppi_img, ppi_fc_img, ppi_ai, ppi_hist, ppi_fc = ppi_series(df)
+    # Monthly series & PPI: history + forecast + AI + metrics
+    imp_img, imp_fc_img, imp_hist_ai, imp_fc_ai, imp_metrics, imp_hist, imp_fc = monthly_series(
+        df, "census_imports", "Census — Total Imports (Monthly)"
+    )
+    exp_img, exp_fc_img, exp_hist_ai, exp_fc_ai, exp_metrics, exp_hist, exp_fc = monthly_series(
+        df, "census_exports", "Census — Total Exports (Monthly)"
+    )
+    ppi_img, ppi_fc_img, ppi_hist_ai, ppi_fc_ai, ppi_metrics, ppi_hist, ppi_fc = ppi_series(df)
 
-    # Partner deep dives with names
-    imp_pd_img, imp_pd_table = partner_deep_dive(df, "census_imports", "Partner Deep-Dive — Imports")
-    exp_pd_img, exp_pd_table = partner_deep_dive(df, "census_exports", "Partner Deep-Dive — Exports")
+    # Partner deep-dives (with names) — add with_ai=True to include narrative if desired
+    imp_pd_img, imp_pd_table = partner_deep_dive(df, "census_imports", "Partner Deep-Dive — Imports", with_ai=True)
+    exp_pd_img, exp_pd_table = partner_deep_dive(df, "census_exports", "Partner Deep-Dive — Exports", with_ai=True)
 
-    # Methodology & glossary
-    methodology = """
+    # Scores table for Methodology
+    def fmt_pct(x): return "" if x is None else f"{x:.1f}%"
+    def fmt_num(x): return "" if x is None else f"{x:,.2f}"
+
+    scores_df = pd.DataFrame([
+        {"Series": "Census Imports (Monthly)",
+         "MAPE": fmt_pct(imp_metrics.get("MAPE")),
+         "sMAPE": fmt_pct(imp_metrics.get("sMAPE")),
+         "RMSE": fmt_num(imp_metrics.get("RMSE")),
+         "Coverage@95": fmt_pct(imp_metrics.get("Coverage95"))},
+        {"Series": "Census Exports (Monthly)",
+         "MAPE": fmt_pct(exp_metrics.get("MAPE")),
+         "sMAPE": fmt_pct(exp_metrics.get("sMAPE")),
+         "RMSE": fmt_num(exp_metrics.get("RMSE")),
+         "Coverage@95": fmt_pct(exp_metrics.get("Coverage95"))},
+        {"Series": "BLS PPI",
+         "MAPE": fmt_pct(ppi_metrics.get("MAPE")),
+         "sMAPE": fmt_pct(ppi_metrics.get("sMAPE")),
+         "RMSE": fmt_num(ppi_metrics.get("RMSE")),
+         "Coverage@95": fmt_pct(ppi_metrics.get("Coverage95"))},
+    ]).fillna("")
+
+    methodology_html = """
 <ul class='note'>
-  <li><b>Models</b>: Exponential Smoothing (Holt-Winters, ETS). Trend always on; seasonality auto (12) if enough history.</li>
-  <li><b>Uncertainty</b>: Shaded area shows ~95% confidence band from residual variance (fallback: ±1σ).</li>
-  <li><b>Backtest</b>: One rolling split: train up to t-12, forecast 12; report MAPE, sMAPE, RMSE for each forecasted series.</li>
-  <li><b>Data</b>: WITS (trade, tariffs), US Census (monthly flows), BLS (PPI).</li>
-  <li><b>Units</b>: K=thousand, M=million, B=billion, T=trillion.</li>
+  <li><b>Model:</b> ETS / Holt-Winters (trend always on; seasonality=12 when history allows).</li>
+  <li><b>Uncertainty:</b> We plot a 95% confidence band using residual variance from the training fit.</li>
+  <li><b>Backtest:</b> Train up to t−12, forecast 12; we report MAPE, sMAPE, RMSE, and Coverage@95 (share of backtest points inside the 95% band).</li>
 </ul>
 """
     glossary = """
 <ul class='note'>
   <li><b>WITS</b>: World Integrated Trade Solution (World Bank).</li>
-  <li><b>MFN</b>: Most-Favoured-Nation tariff (baseline rate applied to WTO members).</li>
+  <li><b>MFN</b>: Most-Favoured-Nation (baseline tariff for WTO members).</li>
   <li><b>PPI</b>: Producer Price Index (upstream cost indicator).</li>
   <li><b>ETS</b>: Exponential Smoothing (Holt-Winters) time-series model.</li>
-  <li><b>HHI</b>: Herfindahl–Hirschman Index (market/partner concentration; 0–10,000; ≥2,500 high).</li>
+  <li><b>HHI</b>: Herfindahl–Hirschman Index (0–10,000; ≥2,500 = high concentration).</li>
   <li><b>YoY</b>: Year-over-Year change.</li>
 </ul>
 """
+    methodology_block = methodology_html + "<h3>Model Scores</h3>" + table_html(scores_df) + "<h3>Glossary</h3>" + glossary
 
-    # Compose HTML
+    # Compose full HTML
     html = f"""<!doctype html>
 <html lang="en"><meta charset="utf-8"/>
 <title>Service Supply Chain — Auto Report</title>
@@ -413,20 +491,19 @@ def build_report():
 {section("WITS — US Trade with World (Annual)", (('<img src="'+trade_img+'"/>') if trade_img else '') + trade_ai)}
 {section("WITS — MFN Average Tariffs", (('<img src="'+tariff_img+'"/>') if tariff_img else '') + tariff_ai)}
 
-{section("Census Imports (Monthly)", (('<img src="'+imp_img+'"/>') if imp_img else '') + imp_ai)}
-{section("Census Imports — 12-month Forecast", (('<img src="'+imp_fc_img+'"/>') if imp_fc_img else '') )}
+{section("Census Imports (Monthly)", (('<img src="'+imp_img+'"/>') if imp_img else '') + imp_hist_ai)}
+{section("Census Imports — 12-month Forecast", (('<img src="'+imp_fc_img+'"/>') if imp_fc_img else '') + imp_fc_ai)}
 
-{section("Census Exports (Monthly)", (('<img src="'+exp_img+'"/>') if exp_img else '') + exp_ai)}
-{section("Census Exports — 12-month Forecast", (('<img src="'+exp_fc_img+'"/>') if exp_fc_img else '') )}
+{section("Census Exports (Monthly)", (('<img src="'+exp_img+'"/>') if exp_img else '') + exp_hist_ai)}
+{section("Census Exports — 12-month Forecast", (('<img src="'+exp_fc_img+'"/>') if exp_fc_img else '') + exp_fc_ai)}
 
-{section("BLS PPI (Upstream Cost)", (('<img src="'+ppi_img+'"/>') if ppi_img else '') + ppi_ai)}
-{section("BLS PPI — 12-month Forecast", (('<img src="'+ppi_fc_img+'"/>') if ppi_fc_img else '') )}
+{section("BLS PPI (Upstream Cost)", (('<img src="'+ppi_img+'"/>') if ppi_img else '') + ppi_hist_ai)}
+{section("BLS PPI — 12-month Forecast", (('<img src="'+ppi_fc_img+'"/>') if ppi_fc_img else '') + ppi_fc_ai)}
 
 {section("Partner Deep-Dive — Imports (Top partners, YoY & HHI)", (('<img src="'+imp_pd_img+'"/>') if imp_pd_img else '') + imp_pd_table)}
 {section("Partner Deep-Dive — Exports (Top partners, YoY & HHI)", (('<img src="'+exp_pd_img+'"/>') if exp_pd_img else '') + exp_pd_table)}
 
-{section("Methodology & Credibility", methodology)}
-{section("Glossary", glossary)}
+{section("Methodology", methodology_block)}
 
 </body></html>"""
 
