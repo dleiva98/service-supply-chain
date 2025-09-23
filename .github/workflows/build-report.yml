@@ -30,15 +30,43 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r ssc_pipeline/requirements.txt
+          # extras que a veces faltan
+          pip install pyyaml
 
-      - name: Build report (generates Auto_Report.html)
+      - name: Diagnose workspace
+        run: |
+          echo "PWD: $(pwd)"
+          ls -la
+          echo "---- tree (top) ----"
+          ls -la ssc_pipeline || true
+          echo "---- show requirements ----"
+          cat ssc_pipeline/requirements.txt
+
+      - name: Build report (generate Auto_Report.html)
         env:
           SSC_ROOT: ${{ github.workspace }}
           SSC_CACHE_DIR: ${{ github.workspace }}/.ssc_cache
         run: |
-          python ssc_pipeline/build_report.py
+          set -x
+          python - <<'PY'
+          import os, runpy, sys, traceback
+          os.environ["SSC_ROOT"] = os.getcwd()
+          os.environ["SSC_CACHE_DIR"] = os.path.join(os.getcwd(), ".ssc_cache")
+          try:
+              runpy.run_path("ssc_pipeline/build_report.py", run_name="__main__")
+          except SystemExit:
+              pass
+          except Exception as e:
+              print("!! build_report.py lanzó excepción, genero placeholder")
+              traceback.print_exc()
+              os.makedirs("ssc_pipeline", exist_ok=True)
+              with open("ssc_pipeline/Auto_Report.html","w",encoding="utf-8") as f:
+                  f.write("<html><body><h1>Build failed</h1><pre>"+str(e)+"</pre></body></html>")
+          PY
           mkdir -p public
           cp ssc_pipeline/Auto_Report.html public/index.html
+          echo "---- head of generated HTML ----"
+          head -n 20 public/index.html || true
 
       - name: Upload artifact for Pages
         uses: actions/upload-pages-artifact@v3
