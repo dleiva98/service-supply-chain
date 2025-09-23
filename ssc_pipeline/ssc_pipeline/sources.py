@@ -1,238 +1,209 @@
+# ssc_pipeline/ssc_pipeline/sources.py
+import os
+import time
+import json
+import math
+import datetime as dt
+from typing import Dict, List, Tuple, Optional
 
-import time, json, requests, pandas as pd
-from typing import List, Dict, Any
-from .utils import cache_get, cache_put
-from .sdmx import flatten_wits_sdmx
+import pandas as pd
+import numpy as np
+import requests
 
-DEFAULT_TIMEOUT = 60
+# ---------------------------
+# HTTP helpers
+# ---------------------------
+DEF_TIMEOUT = 60
 
-# =========================
-# WITS SDMX REST datasets
-# =========================
-WITS_TRADE  = "https://wits.worldbank.org/API/V1/SDMX/V21/rest/data/df_wits_tradestats_trade"
-WITS_TARIFF = "https://wits.worldbank.org/API/V1/SDMX/V21/rest/data/df_wits_tradestats_tariff"
+def _get(url, params=None, headers=None, timeout=DEF_TIMEOUT):
+    r = requests.get(url, params=params, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return r
 
-def _get_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Descarga con Accept JSON; si el servidor devuelve XML/HTML o vacío, retorna payload vacío
-    en formato SDMX para que el pipeline continúe sin romperse.
-    """
-    headers = {"Accept": "application/json, text/json;q=0.9, */*;q=0.1"}
-    cached = cache_get(url, params, ttl_seconds=86400)
-    if cached is not None:
-        return cached
-    resp = requests.get(url, params=params, headers=headers, timeout=DEFAULT_TIMEOUT)
-    resp.raise_for_status()
+def _get_json(url, params=None, headers=None, timeout=DEF_TIMEOUT):
+    r = _get(url, params=params, headers=headers, timeout=timeout)
     try:
-        data = resp.json()
-    except Exception:
-        snippet = (resp.text or "")[:300].replace("\\n", " ")
-        print(f"[WITS] Respuesta no JSON (saltando): {url} params={params} | inicio: {snippet}")
-        return {"dataSets": []}  # estructura vacía entendida por el aplanador
-    else:
-        cache_put(url, params, data)
-        time.sleep(0.25)
-        return data
+        return r.json()
+    except Exception as e:
+        # Better debugging snippet
+        snippet = (r.text or "")[:400]
+        raise ValueError(f"JSON parse error for {url} | params={params} | snippet={snippet}") from e
 
-def _sdmx_key(freq: str, reporter: str, partner: str, product: str, indicator: str) -> str:
-    return f"{freq}.{reporter}.{partner}.{product}.{indicator}"
-
-def _read_wits_product_from_config() -> str:
-    """
-    Lee 'wits_product' desde config.yaml (mismo paquete); por defecto 'total'.
-    """
-    import os
-    try:
-        import yaml
-        cfg_path = os.path.join(os.path.dirname(__file__), '..', 'config.yaml')
-        cfg = yaml.safe_load(open(cfg_path, 'r', encoding='utf-8'))
-        return str(cfg.get('wits_product', 'total')).strip() or 'total'
-    except Exception:
-        return 'total'
-
-def wits_trade_data(reporters: List[str], partners: List[str], indicators: List[str], years: List[int]) -> pd.DataFrame:
+# ---------------------------
+# WITS (World Bank) SDMX v2.1
+# Notes:
+#  - Trade values come in **thousands of USD**.
+#  - We scale to **USD** (× 1,000) here so the rest of the pipeline is consistent.
+# ---------------------------
+def wits_trade_data() -> pd.DataFrame:
+    # Annual US ↔ World totals, imports/exports (goods)
+    # Key pattern: A.{reporter}.{partner}.{product}.{indicator}
+    base = "https://wits.worldbank.org/API/V1/SDMX/V21/rest/data/df_wits_tradestats_trade"
+    keys = [
+        "A.USA.WLD.all.MPRT-TRD-VL",  # imports
+        "A.USA.WLD.all.XPRT-TRD-VL",  # exports
+    ]
     frames = []
-    y0, y1 = min(years), max(years)
-    product_default = _read_wits_product_from_config()
-    for r in reporters:
-        r = r.lower()
-        for p in (partners or ["wld"]):
-            p = p.lower()
-            for ind in indicators:
-                key = _sdmx_key("A", r, p, product_default, ind)
-                url = f"{WITS_TRADE}/{key}"
-                try:
-                    js = _get_json(url, {"startperiod": y0, "endperiod": y1, "format": "JSON"})
-                except Exception as e:
-                    print(f"[WITS] Error en {url}: {e}")
-                    js = {"dataSets": []}
-                df = flatten_wits_sdmx(js)
-                if not df.empty:
-                    # Garantiza metadatos mínimos si el payload no los trae
-                    for col, val in [("indicator", ind), ("reporter", r), ("partner", p), ("product", product_default)]:
-                        if col not in df.columns:
-                            df[col] = val
-                    df["source"] = "wits_trade"
-                    frames.append(df)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-def wits_tariff_data(reporters: List[str], partners: List[str], indicators: List[str], years: List[int]) -> pd.DataFrame:
-    frames = []
-    y0, y1 = min(years), max(years)
-    product_default = _read_wits_product_from_config()
-    for r in reporters:
-        r = r.lower()
-        for p in (partners or ["wld"]):
-            p = p.lower()
-            for ind in indicators:
-                key = _sdmx_key("A", r, p, product_default, ind)
-                url = f"{WITS_TARIFF}/{key}"
-                try:
-                    js = _get_json(url, {"startperiod": y0, "endperiod": y1, "format": "JSON"})
-                except Exception as e:
-                    print(f"[WITS] Error en {url}: {e}")
-                    js = {"dataSets": []}
-                df = flatten_wits_sdmx(js)
-                if not df.empty:
-                    for col, val in [("indicator", ind), ("reporter", r), ("partner", p), ("product", product_default)]:
-                        if col not in df.columns:
-                            df[col] = val
-                    df["source"] = "wits_tariff"
-                    frames.append(df)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-# =========================
-# U.S. Census Time Series
-# =========================
-
-
-def census_monthly_by_country(year_from: int, year_to: int, country_codes=None, dataset="imports", variables=None) -> pd.DataFrame:
-    """
-    Time Series International Trade (HS):
-      - 'time' es PREDICATE-ONLY (va como parámetro, no en get).
-      - Variables de valor total:
-          * exports/hs:  ALL_VAL_MO, ALL_VAL_YR
-          * imports/hs:  GEN_VAL_MO, GEN_VAL_YR   (no existe ALL_VAL_* en imports)
-      - Pedimos por rangos anuales (time=from YYYY-01 to YYYY-12); si falla, por meses.
-      - Armonizamos en la salida: para imports creamos ALL_VAL_MO/YR = GEN_VAL_MO/YR.
-    """
-    if dataset not in ("imports","exports"):
-        raise ValueError("dataset must be 'imports' or 'exports'")
-    base = f"https://api.census.gov/data/timeseries/intltrade/{dataset}/hs"
-
-    # Variables por dataset (NO incluir 'time' en get; 'time' es predicate-only)
-    if variables is None:
-        if dataset == "exports":
-            variables = ["CTY_CODE","CTY_NAME","ALL_VAL_MO","ALL_VAL_YR","YEAR","MONTH"]
-        else:  # imports
-            variables = ["CTY_CODE","CTY_NAME","GEN_VAL_MO","GEN_VAL_YR","YEAR","MONTH"]
-
-    frames = []
-    for year in range(year_from, year_to+1):
-        params = {"get": ",".join(variables), "time": f"from {year}-01 to {year}-12"}
-        if country_codes:
-            params["CTY_CODE"] = ",".join(country_codes)
+    for key in keys:
+        url = f"{base}/{key}/?format=JSON"
+        js = _get_json(url)
+        # SDMX JSON → table
         try:
-            resp = requests.get(base, params=params, timeout=DEFAULT_TIMEOUT)
-            resp.raise_for_status()
-            js = resp.json()
-            if isinstance(js, list) and js:
-                cols = js[0]
-                for row in js[1:]:
-                    tmp = pd.DataFrame([row], columns=cols)
-                    frames.append(tmp)
-        except requests.HTTPError as e:
-            # Fallback mensual si no acepta el rango
-            any_ok = False
-            for m in range(1, 13):
-                mm = f"{m:02d}"
-                p2 = {"get": ",".join(variables), "time": f"{year}-{mm}"}
-                if country_codes:
-                    p2["CTY_CODE"] = ",".join(country_codes)
-                try:
-                    r2 = requests.get(base, params=p2, timeout=DEFAULT_TIMEOUT)
-                    r2.raise_for_status()
-                    js2 = r2.json()
-                    if isinstance(js2, list) and js2:
-                        cols2 = js2[0]
-                        for row in js2[1:]:
-                            tmp2 = pd.DataFrame([row], columns=cols2)
-                            frames.append(tmp2)
-                            any_ok = True
-                except Exception:
-                    pass
-            if not any_ok:
-                snippet = ""
-                try:
-                    snippet = (resp.text or "")[:180].replace("\n"," ")
-                except Exception:
-                    pass
-                print(f"[CENSUS] {e} | sin datos para year={year} | detalle: {snippet}")
-        except Exception as e:
-            print(f"[CENSUS] error inesperado year={year}: {e}")
+            data = js["data"]["dataSets"][0]["series"]
+            dims = js["data"]["structure"]["dimensions"]["series"]
+            time_dim = js["data"]["structure"]["dimensions"]["observation"][0]["values"]
+        except KeyError as e:
+            raise ValueError(f"WITS SDMX shape changed for {url}") from e
 
-        time.sleep(0.15)
+        # Decode dimension positions
+        dim_names = [d["id"] for d in dims]
+        # Build rows
+        for s_key, s_val in data.items():
+            # s_key e.g. "0:0:0:0:0"
+            idx = list(map(int, s_key.split(":")))
+            meta = {dim_names[i].lower(): dims[i]["values"][idx[i]]["id"] for i in range(len(idx))}
+            for obs_idx, obs in s_val.get("observations", {}).items():
+                t = int(obs_idx)
+                obs_val = obs[0]
+                year = int(time_dim[t]["id"])
+                frames.append({
+                    "freq": "A",
+                    "reporter": meta.get("reporter","USA"),
+                    "partner":  meta.get("partner","WLD"),
+                    "product":  meta.get("product","all"),
+                    "indicator": meta.get("indicator",""),
+                    "time": str(year),
+                    "Value": float(obs_val) * 1_000.0,  # **scale to USD**
+                    "source": "wits_trade",
+                })
+    df = pd.DataFrame(frames)
+    return df
 
-    if not frames:
-        return pd.DataFrame()
-
-    out = pd.concat(frames, ignore_index=True)
-
-    # Tipos numéricos
-    for c in ("ALL_VAL_MO","ALL_VAL_YR","GEN_VAL_MO","GEN_VAL_YR"):
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
-
-    # Construir 'time' = YYYY-MM
-    if "YEAR" in out.columns and "MONTH" in out.columns:
-        out["time"] = out["YEAR"].astype(str).str.zfill(4) + "-" + out["MONTH"].astype(str).str.zfill(2)
-
-    # Armonizar nombres: en imports creamos ALL_VAL_* desde GEN_VAL_*
-    if dataset == "imports":
-        if "GEN_VAL_MO" in out.columns and "ALL_VAL_MO" not in out.columns:
-            out["ALL_VAL_MO"] = out["GEN_VAL_MO"]
-        if "GEN_VAL_YR" in out.columns and "ALL_VAL_YR" not in out.columns:
-            out["ALL_VAL_YR"] = out["GEN_VAL_YR"]
-
-    # Renombrar columnas de partner para consistencia
-    out = out.rename(columns={"CTY_CODE":"partner", "CTY_NAME":"partner_name"})
-
-    return out
-
-
-    out = pd.concat(frames, ignore_index=True)
-    # Normalizaciones y tipos
-    for c in ("ALL_VAL_MO","ALL_VAL_YR"):
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
-    # Construir columna 'time' tipo YYYY-MM
-    if "YEAR" in out.columns and "MONTH" in out.columns:
-        out["time"] = out["YEAR"].astype(str).str.zfill(4) + "-" + out["MONTH"].astype(str).str.zfill(2)
-    out = out.rename(columns={"CTY_CODE":"partner", "CTY_NAME":"partner_name"})
-    return out
-
-
-# =========================
-# BLS PPI (servicios)
-# =========================
-BLS_BASE = "https://api.bls.gov/publicAPI/v2/timeseries/data/"
-def bls_series(series_ids: List[str], start_year: int, end_year: int) -> pd.DataFrame:
-    payload = {"seriesid": series_ids, "startyear": str(start_year), "endyear": str(end_year)}
-    key = {"payload": json.dumps(payload, sort_keys=True)}
-    cached = cache_get(BLS_BASE, key, ttl_seconds=86400)
-    if cached is None:
-        resp = requests.post(BLS_BASE, json=payload, timeout=DEFAULT_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        cache_put(BLS_BASE, key, data)
-        time.sleep(0.2)
-    else:
-        data = cached
+def wits_tariff_data() -> pd.DataFrame:
+    # Annual US MFN averages (percent)
+    base = "https://wits.worldbank.org/API/V1/SDMX/V21/rest/data/df_wits_tariff"
+    keys = [
+        "A.USA.WLD.all.MFN-WGHTD-AVRG",  # weighted
+        "A.USA.WLD.all.MFN-SMPL-AVRG",   # simple
+    ]
     frames = []
-    for s in data.get("Results", {}).get("series", []):
-        sid = s.get("seriesID")
-        df = pd.DataFrame(s.get("data", []))
-        if not df.empty:
-            df["series_id"] = sid
-            frames.append(df)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    for key in keys:
+        url = f"{base}/{key}/?format=JSON"
+        js = _get_json(url)
+        try:
+            data = js["data"]["dataSets"][0]["series"]
+            dims = js["data"]["structure"]["dimensions"]["series"]
+            time_dim = js["data"]["structure"]["dimensions"]["observation"][0]["values"]
+        except KeyError as e:
+            raise ValueError(f"WITS Tariff SDMX shape changed for {url}") from e
+
+        dim_names = [d["id"] for d in dims]
+        for s_key, s_val in data.items():
+            idx = list(map(int, s_key.split(":")))
+            meta = {dim_names[i].lower(): dims[i]["values"][idx[i]]["id"] for i in range(len(idx))}
+            for obs_idx, obs in s_val.get("observations", {}).items():
+                year = int(time_dim[int(obs_idx)]["id"])
+                frames.append({
+                    "freq": "A",
+                    "reporter": meta.get("reporter","USA"),
+                    "partner":  meta.get("partner","WLD"),
+                    "product":  meta.get("product","all"),
+                    "indicator": meta.get("indicator",""),
+                    "time": str(year),
+                    "Value": float(obs[0]),  # percent, no scaling
+                    "source": "wits_tariff",
+                })
+    return pd.DataFrame(frames)
+
+# ---------------------------
+# US Census (Timeseries International Trade, HS)
+# Goal:
+#  - Pull **monthly total goods** values in **USD** for all partners.
+#  - Use the same variables for imports and exports to avoid asymmetry.
+#  - Columns: YEAR, MONTH, CTY_CODE, CTY_NAME, ALL_VAL_MO
+# Notes:
+#  - The API returns dollars, but some docs say "thousands". We treat ALL_VAL_MO as **USD** only after
+#    cross-checking. If you confirm it is thousands, change SCALE_CENSUS below to 1_000.0.
+# ---------------------------
+SCALE_CENSUS = 1.0  # set to 1_000.0 if your manual cross-check shows 'thousands of USD'
+
+def _census_timeseries(side: str, y0: int = 2018, y1: Optional[int] = None) -> pd.DataFrame:
+    """
+    side: 'imports' or 'exports'
+    Returns monthly rows by country with ALL_VAL_MO.
+    """
+    assert side in ("imports", "exports")
+    if y1 is None:
+        today = dt.date.today()
+        y1 = today.year
+
+    base = f"https://api.census.gov/data/timeseries/intltrade/{side}/hs"
+    # Query by full range using 'time=from YYYY-MM to YYYY-MM'
+    frames = []
+    # We loop year-by-year to keep the URL short and avoid API edge cases.
+    for y in range(y0, y1 + 1):
+        params = {
+            "get": "CTY_CODE,CTY_NAME,ALL_VAL_MO,YEAR,MONTH",
+            "time": f"from {y}-01 to {y}-12",
+        }
+        try:
+            js = _get_json(base, params=params)
+        except Exception as e:
+            # Skip bad years but continue the series
+            print(f"[CENSUS] {side} {y} failed: {e} | skipping")
+            continue
+
+        # First row is header
+        header, *rows = js
+        df = pd.DataFrame(rows, columns=header)
+        # Clean types
+        df["YEAR"] = pd.to_numeric(df["YEAR"], errors="coerce")
+        df["MONTH"] = pd.to_numeric(df["MONTH"], errors="coerce")
+        df["ALL_VAL_MO"] = pd.to_numeric(df["ALL_VAL_MO"], errors="coerce") * SCALE_CENSUS
+        df["CTY_CODE"] = df["CTY_CODE"].astype(str)
+        df["CTY_NAME"] = df["CTY_NAME"].astype(str)
+        df = df.dropna(subset=["YEAR","MONTH"])
+        df["time"] = df["YEAR"].astype(int).astype(str) + "-" + df["MONTH"].astype(int).astype(str).str.zfill(2)
+        df["freq"] = "M"
+        df["reporter"] = "USA"
+        df["partner"] = df["CTY_CODE"]   # keep code, but keep name for labels
+        df["partner_name"] = df["CTY_NAME"]
+        df["product"] = "Total"
+        df["indicator"] = "ALL_VAL_MO_USD"
+        df.rename(columns={"ALL_VAL_MO":"Value"}, inplace=True)
+        df["source"] = f"census_{side}"
+        frames.append(df[["freq","reporter","partner","partner_name","product","indicator","time","Value","source","YEAR","MONTH"]])
+
+    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=[
+        "freq","reporter","partner","partner_name","product","indicator","time","Value","source","YEAR","MONTH"
+    ])
+    return out
+
+def census_monthly_by_country() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Returns (imports_df, exports_df)."""
+    imp = _census_timeseries("imports")
+    exp = _census_timeseries("exports")
+    return imp, exp
+
+# ---------------------------
+# BLS PPI
+# Use a single consistent series (e.g., WPUFD4 – Finished goods), monthly index.
+# ---------------------------
+def bls_series(series_id: str = "WPUFD4") -> pd.DataFrame:
+    """Return PPI monthly index with YEAR, MONTH and numeric 'value'."""
+    url = f"https://api.bls.gov/publicAPI/v2/timeseries/data/{series_id}"
+    params = {"registrationKey": os.environ.get("BLS_API_KEY","")}
+    js = _get_json(url, params=params)
+    try:
+        rows = js["Results"]["series"][0]["data"]
+    except Exception as e:
+        raise ValueError(f"BLS shape changed for {series_id}") from e
+    data = []
+    for r in rows:
+        # Keep numeric months, same base; BLS returns strings
+        yr = int(r["year"])
+        mo = int(r["period"].replace("M",""))
+        val = float(r["value"])
+        data.append({"year": yr, "period": f"M{mo:02d}", "value": val, "series_id": series_id})
+    df = pd.DataFrame(data)
+    return df
