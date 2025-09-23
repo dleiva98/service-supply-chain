@@ -395,12 +395,39 @@ def build_report():
         fc_notes.append("Census exports: 12-month ETS forecast rendered.")
     if not ppi_fc.empty:
         fc_notes.append("BLS PPI: 12-month ETS forecast rendered.")
-    fc_explainer = """
-We forecast the next 12 months with an Exponential Smoothing (Holt-Winters) model.
-It’s robust for monthly series, handles trend and—when enough history exists—seasonality (12).
-Use forecasts as directional guidance (baseline), not as hard targets. """
 
-    # Compose HTML
+    fc_explainer = (
+        "We forecast the next 12 months with an Exponential Smoothing (Holt-Winters) model. "
+        "It is robust for monthly series, handles trend and—when enough history exists—seasonality (12). "
+        "Use forecasts as directional guidance (baseline), not as hard targets."
+    )
+
+    # ---- NEW: build the forecasts block outside the big f-string (no nested f-strings)
+    forecast_items = ''.join(f'<li>{x}</li>' for x in fc_notes) if fc_notes else '<li>No forecast series available.</li>'
+    forecast_block = (
+        "<ul>" + forecast_items + "</ul>"
+        f"<p>{fc_explainer}</p>"
+    )
+
+    # Sample tables (clean)
+    wits_cols   = ["freq","reporter","partner","product","indicator","time","Value"]
+    census_cols = ["time","partner","partner_name","ALL_VAL_MO","ALL_VAL_YR"]
+    bls_cols    = ["series_id","year","period","periodName","value"]
+
+    samples_html = (
+        "<h3 class='badge'>WITS Trade</h3>" +
+        table_html(df[df["source"].eq("wits_trade")], cols=wits_cols) +
+        "<h3 class='badge'>WITS Tariff</h3>" +
+        table_html(df[df["source"].eq("wits_tariff")], cols=wits_cols) +
+        "<h3 class='badge'>Census Imports</h3>" +
+        table_html(df[df["source"].eq("census_imports")], cols=census_cols) +
+        "<h3 class='badge'>Census Exports</h3>" +
+        table_html(df[df["source"].eq("census_exports")], cols=census_cols) +
+        "<h3 class='badge'>BLS PPI</h3>" +
+        table_html(df[df["source"].eq("bls_ppi")], cols=bls_cols)
+    )
+
+    # Compose HTML (outer f-string only; we inject pre-built blocks/strings)
     html = f"""<!doctype html>
 <html lang="en">
 <meta charset="utf-8"/>
@@ -409,19 +436,14 @@ Use forecasts as directional guidance (baseline), not as hard targets. """
 <body>
 <h1>Service Supply Chain — Auto Report</h1>
 <p><small>Generated: <b>{now_utc()}</b>{' · Last pull: <b>'+pulled+'</b>' if pulled else ''}</small></p>
-{section("Executive Summary (AI)", f"<pre>{ai_summary}</pre>")}
+{section("Executive Summary (AI)", "<pre>"+ai_summary+"</pre>")}
 {section("Overview", kpi_html + table_html(by_src, max_rows=20))}
-{section("Trade — WITS (USA ↔ World)", f"{('<img src=\"'+img_trade+'\"/>') if img_trade else '<p><em>No WITS trade data available.</em></p>'}")}
-{section("Tariffs — WITS MFN Averages", f"{('<img src=\"'+img_tariff+'\"/>') if img_tariff else '<p><em>No tariff data available.</em></p>'}")}
-{section("Census Monthly Imports", f"{('<img src=\"'+img_cimp+'\"/>') if img_cimp else '<p><em>No monthly imports data.</em></p>'}")}
-{section("Census Monthly Exports", f"{('<img src=\"'+img_cexp+'\"/>') if img_cexp else '<p><em>No monthly exports data.</em></p>'}")}
-{section("BLS Producer Price Index", f"{('<img src=\"'+img_ppi+'\"/>') if img_ppi else '<p><em>No PPI data.</em></p>'}")}
-{section("12-Month Forecasts", f"""
-  <ul>
-    {''.join(f'<li>{x}</li>' for x in fc_notes) if fc_notes else '<li>No forecast series available.</li>'}
-  </ul>
-  <p>{fc_explainer}</p>
-""")}
+{section("Trade — WITS (USA ↔ World)", ('<img src="'+img_trade+'"/>') if img_trade else '<p><em>No WITS trade data available.</em></p>')}
+{section("Tariffs — WITS MFN Averages", ('<img src="'+img_tariff+'"/>') if img_tariff else '<p><em>No tariff data available.</em></p>')}
+{section("Census Monthly Imports", ('<img src="'+img_cimp+'"/>') if img_cimp else '<p><em>No monthly imports data.</em></p>')}
+{section("Census Monthly Exports", ('<img src="'+img_cexp+'"/>') if img_cexp else '<p><em>No monthly exports data.</em></p>')}
+{section("BLS Producer Price Index", ('<img src="'+img_ppi+'"/>') if img_ppi else '<p><em>No PPI data.</em></p>')}
+{section("12-Month Forecasts", forecast_block)}
 {section("Data Samples", samples_html)}
 </body>
 </html>"""
