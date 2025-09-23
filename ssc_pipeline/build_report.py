@@ -442,4 +442,3 @@ Keep it short (5–8 bullets) and public-facing (no jargon).
 if __name__ == "__main__":
     build_report()
 
-
