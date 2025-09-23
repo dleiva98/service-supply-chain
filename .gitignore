@@ -1,0 +1,14 @@
+# Python / Jupyter
+__pycache__/
+.ipynb_checkpoints/
+
+# Caches del pipeline
+.ssc_cache/
+*.bak.*.ipynb
+
+# Archivos temporales
+*.tmp
+*.log
+
+# (opcional) si no quieres subir el CSV grande en las primeras pruebas, comenta esta línea
+# main.csv

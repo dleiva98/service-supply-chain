@@ -1,0 +1,14 @@
+
+reporters: ["usa"]
+partners: ["wld","can","mex","chn","jpn","deu"]
+years: [2019, 2020, 2021, 2022, 2023, 2024, 2025]
+
+wits_trade_indicators: ["MPRT-TRD-VL","XPRT-TRD-VL"]
+wits_tariff_indicators: ["MFN-WGHTD-AVRG","MFN-SMPL-AVRG"]
+
+bls_series: ["WPUFD4","WPSID612"]
+bls_start_year: 2010
+bls_end_year: 2025
+
+# Producto/grupo por defecto para WITS Trade/Tariff
+wits_product: "total"
