@@ -102,29 +102,52 @@ def to_ym(s):
 # =========================
 # Forecasting (ETS: robust defaults)
 # =========================
+# --- replace your current ets_forecast() with this safe version ---
+
 def ets_forecast(series: pd.Series, periods=12):
     """
-    Simple ETS (Holt-Winters) forecast with automatic seasonality detect (12 for monthly).
-    Returns: pd.DataFrame with columns ['date','yhat'] where date is period end (month-end).
+    Safe Exponential Smoothing forecast:
+    - If statsmodels is available: Holt-Winters (trend + seasonality if enough history)
+    - If not, fall back to a simple moving-average extrapolation
+    - Always returns a DataFrame with columns ['date','yhat'] (may be empty)
     """
-    from statsmodels.tsa.holtwinters import ExponentialSmoothing
     s = series.dropna().astype(float)
     if len(s) < 6:
         return pd.DataFrame(columns=["date","yhat"])
-    # assume monthly
-    seasonal = "add" if len(s) >= 24 else None
-    m = 12 if seasonal else None
+
+    # Try real ETS first
     try:
-        model = ExponentialSmoothing(
-            s, trend="add", seasonal=seasonal, seasonal_periods=m, initialization_method="estimated"
-        ).fit(optimized=True)
+        from statsmodels.tsa.holtwinters import ExponentialSmoothing
+        seasonal = "add" if len(s) >= 24 else None
+        m = 12 if seasonal else None
+        try:
+            model = ExponentialSmoothing(
+                s, trend="add", seasonal=seasonal, seasonal_periods=m, initialization_method="estimated"
+            ).fit(optimized=True)
+        except Exception:
+            # fallback to Holt (trend only) if seasonal fit fails
+            model = ExponentialSmoothing(
+                s, trend="add", initialization_method="estimated"
+            ).fit(optimized=True)
         f = model.forecast(periods)
         return pd.DataFrame({"date": f.index.to_timestamp(), "yhat": f.values})
+
     except Exception:
-        # fallback: simple Holt
-        model = ExponentialSmoothing(s, trend="add", initialization_method="estimated").fit(optimized=True)
-        f = model.forecast(periods)
-        return pd.DataFrame({"date": f.index.to_timestamp(), "yhat": f.values})
+        # No statsmodels (or import error) -> moving-average drift fallback
+        try:
+            import pandas as _pd
+            mean_val = float(_pd.Series(s).tail(12).mean()) if len(s) >= 12 else float(_pd.Series(s).mean())
+            last_date = s.index[-1]
+            # build a monthly date index forward
+            if hasattr(last_date, "to_timestamp"):
+                start = last_date.to_timestamp()
+            else:
+                start = _pd.Timestamp(last_date)
+            dates = _pd.date_range(start=start + _pd.offsets.MonthBegin(1), periods=periods, freq="MS")
+            return _pd.DataFrame({"date": dates, "yhat": [mean_val]*periods})
+        except Exception:
+            return pd.DataFrame(columns=["date","yhat"])
+
 
 # =========================
 # Charts
