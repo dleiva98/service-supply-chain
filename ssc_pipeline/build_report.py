@@ -20,7 +20,7 @@ def gpt_exec_summary(context: dict) -> str:
     Returns an executive English summary using OpenAI if OPENAI_API_KEY is set.
     Otherwise returns a concise fallback.
     """
-    key = os.environ.get("OPENAI_API_KEY", "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").strip()
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not key:
         return ("(AI summary disabled — add an OPENAI_API_KEY repository secret to enable "
                 "the executive narrative.)")
