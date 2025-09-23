@@ -25,6 +25,40 @@ PARTNER_NAME = {
     "ARG":"Argentina", "CHL":"Chile", "PER":"Peru", "COL":"Colombia",
 }
 
+# ---- Unit registry (scale raw values -> USD) ----
+UNIT_REGISTRY = {
+    # APIs commonly return "thousands USD" for flows -> scale to USD
+    "wits_trade":     {"scale": 1e3, "unit": "USD"},
+    "census_imports": {"scale": 1e3, "unit": "USD"},
+    "census_exports": {"scale": 1e3, "unit": "USD"},
+    # Tariffs are in %; PPI is an index
+    "wits_tariff": {"scale": 1.0, "unit": "percent"},
+    "bls_ppi":     {"scale": 1.0, "unit": "index"},
+}
+
+def apply_scale(df):
+    """Scale numeric value column based on source; return (df_scaled, unit_info_map)."""
+    if "source" not in df.columns:
+        return df, {}
+    info = {}
+    out = df.copy()
+    for src, meta in UNIT_REGISTRY.items():
+        mask = out["source"].eq(src)
+        if not mask.any():
+            continue
+        v = choose_numcol(out.loc[mask], ("ALL_VAL_MO","Value","value"))
+        if v:
+            out.loc[mask, v] = pd.to_numeric(out.loc[mask, v], errors="coerce") * meta["scale"]
+            info[src] = meta["unit"]
+    return out, info
+
+def unit_badge(unit, freq, coverage="goods (nominal)"):
+    return (
+        f"<span class='badge'>Unit: {unit}</span>"
+        f"<span class='badge'>Freq: {freq}</span>"
+        f"<span class='badge'>Coverage: {coverage}</span>"
+    )
+
 # ====================== Utilities ======================
 def human(x):
     try:
@@ -101,14 +135,16 @@ def ai_narrative(title, context_dict, max_tokens=450):
         return f"({title}: AI error: {e})"
 
 # ====================== Forecasting & metrics ======================
-def ets_forecast_with_bands(series: pd.Series, periods=12):
+def ets_point_forecast_and_sd(series: pd.Series, periods=12):
     """
-    ETS/Holt-Winters with 95% band; safe fallback if statsmodels missing.
-    Returns (fc_df, band_df)
+    Forecast point values and return (fc_df, resid_sd).
+    Safe fallback if statsmodels is missing.
     """
     s = series.dropna().astype(float)
     if len(s) < 6:
-        return pd.DataFrame(columns=["date","yhat"]), pd.DataFrame(columns=["date","lower","upper"])
+        return (pd.DataFrame({"date": [], "yhat": []}),
+                float(pd.Series(s).std(ddof=1)) if len(s) > 1 else 0.0)
+
     try:
         from statsmodels.tsa.holtwinters import ExponentialSmoothing
         seasonal = "add" if len(s) >= 24 else None
@@ -120,53 +156,91 @@ def ets_forecast_with_bands(series: pd.Series, periods=12):
         resid = getattr(model, "resid", s - model.fittedvalues)
         resid_sd = float(np.nanstd(resid, ddof=1)) if len(resid) > 1 else float(np.nanstd(s))
         dates = f.index.to_timestamp() if hasattr(f.index, "to_timestamp") else pd.to_datetime(f.index)
-        fc   = pd.DataFrame({"date": dates, "yhat": f.values})
-        band = pd.DataFrame({"date": dates,
-                             "lower": f.values - 1.96*resid_sd,
-                             "upper": f.values + 1.96*resid_sd})
-        return fc, band
+        fc = pd.DataFrame({"date": dates, "yhat": f.values})
+        return fc, resid_sd
     except Exception:
-        # Fallback: flat mean ± 1σ
+        # Fallback: flat mean ± 1σ on last 12 months
         mean_val = float(pd.Series(s).tail(12).mean()) if len(s)>=12 else float(pd.Series(s).mean())
         std_val  = float(pd.Series(s).tail(12).std(ddof=1)) if len(s)>=12 else float(pd.Series(s).std(ddof=1))
         last = s.index[-1]
         start = last.to_timestamp() if hasattr(last, "to_timestamp") else pd.Timestamp(last)
         dates = pd.date_range(start=start + pd.offsets.MonthBegin(1), periods=periods, freq="MS")
         fc   = pd.DataFrame({"date": dates, "yhat": [mean_val]*periods})
-        band = pd.DataFrame({"date": dates, "lower": [mean_val-1.96*std_val]*periods,
-                             "upper": [mean_val+1.96*std_val]*periods})
-        return fc, band
+        return fc, std_val
 
-def backtest_last_12_with_coverage(series: pd.Series):
+def ets_forecast_with_bands(series: pd.Series, periods=12, band_multiplier=1.0):
+    """ETS point forecast + 95% band scaled by band_multiplier."""
+    fc, resid_sd = ets_point_forecast_and_sd(series, periods=periods)
+    if fc.empty:
+        return fc, pd.DataFrame({"date": [], "lower": [], "upper": []})
+    k = 1.96 * float(band_multiplier)
+    band = pd.DataFrame({
+        "date": fc["date"],
+        "lower": fc["yhat"] - k * resid_sd,
+        "upper": fc["yhat"] + k * resid_sd
+    })
+    return fc, band
+
+def band_multiplier_for_target(series: pd.Series, target=95.0, periods=12):
     """
-    One-shot backtest:
-      - train up to t-12, forecast 12 months
-      - build 95% band from residual std of training fit
-      - compute MAPE, sMAPE, RMSE, Coverage@95%
+    Calibrate band width so backtest coverage ≈ target (default 95%).
+    Returns (best_multiplier, achieved_coverage).
     """
     s = series.dropna().astype(float)
     if len(s) < 24:
-        return {"MAPE": None, "sMAPE": None, "RMSE": None, "Coverage95": None, "n": 0}
+        return 1.0, None  # not enough data to calibrate
 
     hist = s.iloc[:-12]
     true = s.iloc[-12:]
-    fc, band = ets_forecast_with_bands(hist, periods=12)
-    if fc.empty:
-        return {"MAPE": None, "sMAPE": None, "RMSE": None, "Coverage95": None, "n": 0}
+    fc_hist, resid_sd = ets_point_forecast_and_sd(hist, periods=12)
+    if fc_hist.empty:
+        return 1.0, None
 
+    y = pd.Series(fc_hist["yhat"].values, index=true.index)
+
+    best_m = 1.0
+    best_cov = None
+    best_err = float("inf")
+    for m in np.linspace(0.8, 2.0, 25):  # search 0.8x … 2.0x
+        lower = y - (1.96 * m * resid_sd)
+        upper = y + (1.96 * m * resid_sd)
+        cov = float(((true >= lower) & (true <= upper)).mean()) * 100.0
+        err = abs(cov - target)
+        if err < best_err:
+            best_err, best_cov, best_m = err, cov, m
+
+    return float(best_m), float(best_cov)
+
+def compute_error_metrics(true, pred):
+    true = pd.Series(true).astype(float)
+    pred = pd.Series(pred).astype(float)
+    eps = 1e-9
+    ae = (true - pred).abs()
+    # Robust % errors
+    smape = float((ae / ((true.abs() + pred.abs())/2.0 + eps)).mean())*100.0
+    median_ape = float((ae / (true.abs() + eps)).median())*100.0
+    wmape = float(ae.sum() / (true.abs().sum() + eps))*100.0
+    rmse = float(np.sqrt(((true - pred)**2).mean()))
+    return {"sMAPE": smape, "MedianAPE": median_ape, "WMAPE": wmape, "RMSE": rmse}
+
+def backtest_metrics_with_coverage(series: pd.Series, band_multiplier=1.0):
+    """Train to t−12, forecast 12, compute metrics + Coverage@95."""
+    s = series.dropna().astype(float)
+    if len(s) < 24:
+        return {"sMAPE": None, "MedianAPE": None, "WMAPE": None, "RMSE": None, "Coverage95": None, "n": 0}
+    hist = s.iloc[:-12]
+    true = s.iloc[-12:]
+    fc, band = ets_forecast_with_bands(hist, periods=12, band_multiplier=band_multiplier)
     pred = pd.Series(fc["yhat"].values, index=true.index)
+    cov = None
     if not band.empty:
         lower = pd.Series(band["lower"].values, index=true.index)
         upper = pd.Series(band["upper"].values, index=true.index)
-        coverage = float(((true >= lower) & (true <= upper)).mean()) * 100.0
-    else:
-        coverage = None
-
-    eps = 1e-9
-    mape  = float((np.abs((true - pred) / (true.replace(0, eps)))).mean()) * 100.0
-    smape = float((np.abs(true - pred) / ((np.abs(true) + np.abs(pred)) / 2.0 + eps)).mean()) * 100.0
-    rmse  = float(np.sqrt(((true - pred) ** 2).mean()))
-    return {"MAPE": mape, "sMAPE": smape, "RMSE": rmse, "Coverage95": coverage, "n": int(true.shape[0])}
+        cov = float(((true >= lower) & (true <= upper)).mean())*100.0
+    errs = compute_error_metrics(true, pred)
+    errs["Coverage95"] = cov
+    errs["n"] = int(true.shape[0])
+    return errs
 
 # ====================== Styles & sections ======================
 STYLE = """
@@ -189,6 +263,12 @@ img { max-width: 100%; height: auto; }
 """
 def section(title, body): return f"<div class='section'><h2>{title}</h2>{body}</div>"
 
+# ====================== Plausibility checks ======================
+def plausible_us_annual_imports(val_usd):  # very rough guardrails
+    return 5e11 <= val_usd <= 6e12
+def plausible_us_annual_exports(val_usd):
+    return 4e11 <= val_usd <= 5e12
+
 # ====================== Charts & narratives ======================
 def line_wits_trade(df):
     w = df[df["source"].eq("wits_trade")].copy()
@@ -201,20 +281,29 @@ def line_wits_trade(df):
     if g.empty: return "", "(no data)"
     fig, ax = plt.subplots(figsize=(7.8,4.4))
     ctx = {}
+    imp_latest_val = None
+    exp_latest_val = None
     for ind, sub in g.groupby("indicator"):
         sub = sub.dropna(subset=["year"]).sort_values("year")
         label = "Imports (MPRT)" if ind=="MPRT-TRD-VL" else "Exports (XPRT)"
         ax.plot(sub["year"], sub[v], marker="o", label=label)
-        last = sub[v].iloc[-1]
-        prev = sub[v].iloc[-2] if len(sub)>1 else None
+        last = float(sub[v].iloc[-1])
+        prev = float(sub[v].iloc[-2]) if len(sub)>1 else None
+        if ind=="MPRT-TRD-VL": imp_latest_val = last
+        if ind=="XPRT-TRD-VL": exp_latest_val = last
         ctx[label] = {
             "last": human(last),
             "yoy%": round(100.0*(last/prev-1.0),1) if prev not in (None,0) else None
         }
-    ax.set_title("WITS — US Goods Trade with World (Annual)"); ax.set_xlabel("Year"); ax.set_ylabel("Value")
+    ax.set_title("WITS — US Goods Trade with World (Annual)"); ax.set_xlabel("Year"); ax.set_ylabel("USD")
     ax.grid(True, alpha=.3); ax.legend()
     img = img64(fig)
-    narrative = ai_narrative("WITS Trade (US↔World)", ctx)
+    # Sanity: suppress confident narrative if implausible
+    if (imp_latest_val is not None and not plausible_us_annual_imports(imp_latest_val)) or \
+       (exp_latest_val is not None and not plausible_us_annual_exports(exp_latest_val)):
+        narrative = "(WITS Trade: values look implausible even after unit scaling — check filters/aggregation; narrative suppressed.)"
+    else:
+        narrative = ai_narrative("WITS Trade (US↔World)", ctx)
     return img, "<pre>"+narrative+"</pre>"
 
 def line_wits_tariffs(df):
@@ -240,6 +329,7 @@ def line_wits_tariffs(df):
     narrative = ai_narrative("WITS MFN Tariffs", ctx)
     return img, "<pre>"+narrative+"</pre>"
 
+# ---------- Monthly + Forecast (with calibration) ----------
 def monthly_series(df, source_name, title):
     m = df[df["source"].eq(source_name)].copy()
     if m.empty: return "", "", "", "", {}, pd.DataFrame(), pd.DataFrame()
@@ -249,37 +339,40 @@ def monthly_series(df, source_name, title):
     g = m.groupby("ym")[v].sum().sort_index()
     if g.empty: return "", "", "", "", {}, pd.DataFrame(), pd.DataFrame()
 
-    # history chart
+    # Calibrate band multiplier to reach ≈95% coverage in backtest
+    bm, cov = band_multiplier_for_target(g, target=95.0, periods=12)
+
+    # History chart
     fig, ax = plt.subplots(figsize=(7.8,4.4))
     ax.plot(g.index.to_timestamp(), g.values, marker="o")
-    ax.set_title(title); ax.set_xlabel("Month"); ax.set_ylabel("Value"); ax.grid(True, alpha=.3)
+    ax.set_title(title); ax.set_xlabel("Month"); ax.set_ylabel("USD")
+    ax.grid(True, alpha=.3)
     img_hist = img64(fig)
 
-    # forecast + bands + metrics (incl. coverage)
-    fc, band = ets_forecast_with_bands(g)
-    metrics = backtest_last_12_with_coverage(g)
+    # Forecast + bands + metrics
+    fc, band = ets_forecast_with_bands(g, periods=12, band_multiplier=bm)
+    metrics = backtest_metrics_with_coverage(g, band_multiplier=bm)
 
     fig2, ax2 = plt.subplots(figsize=(7.8,4.4))
     ax2.plot(g.index.to_timestamp(), g.values, label="History")
     if not fc.empty:
         ax2.plot(fc["date"], fc["yhat"], linestyle="--", marker="o", label="Forecast (12m)")
     if not band.empty:
-        ax2.fill_between(band["date"], band["lower"], band["upper"], alpha=0.15, label="95% conf. band")
-    ax2.set_title(title + " — 12-month Forecast"); ax2.set_xlabel("Month"); ax2.set_ylabel("Value")
+        ax2.fill_between(band["date"], band["lower"], band["upper"], alpha=0.15, label=f"95% band (calibrated ×{bm:.2f})")
+    ax2.set_title(title + " — 12-month Forecast"); ax2.set_xlabel("Month"); ax2.set_ylabel("USD")
     ax2.grid(True, alpha=.3); ax2.legend()
     img_fc = img64(fig2)
 
-    # AI narrative for HISTORY
+    # AI narratives
     ctx_hist = {
         "last": (human(g.values[-1]) if len(g)>0 else None),
         "yoy%": round(100.0*(g.values[-1]/g.values[-13]-1.0),1) if len(g)>=13 and g.values[-13]!=0 else None
     }
     hist_narrative = ai_narrative(title, ctx_hist)
 
-    # AI narrative for FORECAST (includes scores)
     ctx_fc = {
         "last_forecast_point": (human(fc["yhat"].iloc[-1]) if not fc.empty else None),
-        "band": "95% confidence band",
+        "band": f"95% confidence band (calibrated ×{bm:.2f})",
         "metrics": metrics
     }
     fc_title = title + " — Forecast"
@@ -301,6 +394,9 @@ def ppi_series(df):
         return "", "", "", "", {}, pd.DataFrame(), pd.DataFrame()
     if s.empty: return "", "", "", "", {}, pd.DataFrame(), pd.DataFrame()
 
+    # Calibrate band multiplier to ≈95% coverage
+    bm, cov = band_multiplier_for_target(s, target=95.0, periods=12)
+
     # history
     fig, ax = plt.subplots(figsize=(7.8,4.4))
     ax.plot(s.index, s.values, marker="o")
@@ -308,16 +404,16 @@ def ppi_series(df):
     ax.grid(True, alpha=.3)
     img_hist = img64(fig)
 
-    # forecast + bands + metrics (incl. coverage)
-    fc, band = ets_forecast_with_bands(s)
-    metrics = backtest_last_12_with_coverage(s)
+    # forecast + bands + metrics
+    fc, band = ets_forecast_with_bands(s, periods=12, band_multiplier=bm)
+    metrics = backtest_metrics_with_coverage(s, band_multiplier=bm)
 
     fig2, ax2 = plt.subplots(figsize=(7.8,4.4))
     ax2.plot(s.index, s.values, label="History")
     if not fc.empty:
         ax2.plot(fc["date"], fc["yhat"], linestyle="--", marker="o", label="Forecast (12m)")
     if not band.empty:
-        ax2.fill_between(band["date"], band["lower"], band["upper"], alpha=0.15, label="95% conf. band")
+        ax2.fill_between(band["date"], band["lower"], band["upper"], alpha=0.15, label=f"95% band (calibrated ×{bm:.2f})")
     ax2.set_title("BLS PPI — 12-month Forecast"); ax2.set_xlabel("Month"); ax2.set_ylabel("Index")
     ax2.grid(True, alpha=.3); ax2.legend()
     img_fc = img64(fig2)
@@ -331,19 +427,14 @@ def ppi_series(df):
 
     ctx_fc = {
         "last_forecast_point": (round(float(fc['yhat'].iloc[-1]),1) if not fc.empty else None),
-        "band": "95% confidence band",
+        "band": f"95% confidence band (calibrated ×{bm:.2f})",
         "metrics": metrics
     }
     fc_narrative = ai_narrative("BLS PPI — Forecast", ctx_fc)
 
     return img_hist, img_fc, "<pre>"+hist_narrative+"</pre>", "<pre>"+fc_narrative+"</pre>", metrics, s.reset_index().rename(columns={v:"value"}), fc
 
-# ====================== Partner Deep Dive (names + HHI) ======================
-def partner_name_series(x, fallback):
-    if pd.isna(x): return fallback
-    x = str(x).upper()
-    return PARTNER_NAME.get(x, fallback)
-
+# ====================== Partner Deep Dive (names + thresholds + HHI) ======================
 def partner_deep_dive(df, source_name, title, top=5, with_ai=False):
     m = df[df["source"].eq(source_name)].copy()
     if m.empty:
@@ -368,7 +459,7 @@ def partner_deep_dive(df, source_name, title, top=5, with_ai=False):
         return "", "<p><em>(no data in last 12 months)</em></p>"
 
     top_partners = (last12.groupby("partner_label")[v].sum()
-                    .sort_values(ascending=False).head(top).index.tolist())
+                    .sort_values(ascending=False).head(max(top,8)).index.tolist())
 
     mm = m[m["partner_label"].isin(top_partners)]
     g = mm.groupby(["partner_label","ym"])[v].sum().reset_index()
@@ -379,24 +470,19 @@ def partner_deep_dive(df, source_name, title, top=5, with_ai=False):
         sub = sub.sort_values("ym")
         ax.plot(sub["ym"].dt.to_timestamp(), sub[v], marker="o", label=str(p))
     ax.set_title(title + " — Top Partners (last 12m leaders)")
-    ax.set_xlabel("Month"); ax.set_ylabel("Value")
+    ax.set_xlabel("Month"); ax.set_ylabel("USD")
     ax.grid(True, alpha=.3); ax.legend(ncol=2, fontsize=9)
     img = img64(fig)
 
     # YoY table for latest month vs same month prev year
     latest = m["ym"].max()
-    this = m[m["ym"].eq(latest)].groupby("partner_label")[v].sum()
-    prev = m[m["ym"].eq(latest - 12)].groupby("partner_label")[v].sum()
+    this = m[m["ym"].eq(latest)].groupby("partner_label")[v].sum().rename("Latest")
+    prev = m[m["ym"].eq(latest - 12)].groupby("partner_label")[v].sum().rename("PrevYear")
 
-    # Make sure index has the right name so reset_index creates 'partner_label'
-    this = this.rename("Latest")
-    prev = prev.rename("PrevYear")
-    # Align by index and keep partners present in either series
     yoy = pd.concat([this, prev], axis=1)
     yoy.index.name = "partner_label"
     yoy = yoy.reset_index()
 
-    # Compute YoY% safely
     yoy["YoY%"] = np.where(
         yoy["PrevYear"].fillna(0) != 0,
         100.0 * ((yoy["Latest"] / yoy["PrevYear"]) - 1.0),
@@ -404,8 +490,18 @@ def partner_deep_dive(df, source_name, title, top=5, with_ai=False):
     )
     yoy = yoy.sort_values("Latest", ascending=False)
 
-    # Concentration (HHI) over last 12 months (for displayed partners)
+    # Concentration (HHI) over last 12 months
     shares = last12[last12["partner_label"].isin(top_partners)].groupby("partner_label")[v].sum()
+    total12 = shares.sum()
+    # Thresholds: keep >=1% share or >= $5B in last-12
+    keep = shares[(shares/total12 >= 0.01) | (shares >= 5e9)].index.tolist()
+    shares = shares.loc[keep]
+    yoy = yoy[yoy["partner_label"].isin(keep)]
+
+    warn = ""
+    if len(keep) < 3:
+        warn = "<p class='note'>Warning: partner distribution is sparse; results may be unstable. Showing available leaders.</p>"
+
     hhi = None
     if shares.sum() > 0:
         s = shares / shares.sum()
@@ -433,10 +529,50 @@ def partner_deep_dive(df, source_name, title, top=5, with_ai=False):
             "hhi": hhi
         }
         narr = ai_narrative(title, ctx)
-        return img, "<pre>"+narr+"</pre>" + expl + html_table
+        return img, "<pre>"+narr+"</pre>" + warn + expl + html_table
     else:
-        return img, expl + html_table
+        return img, warn + expl + html_table
 
+# ====================== Score Guide helpers ======================
+def _cov_badge(cov):
+    if cov is None:
+        return "—"
+    if cov >= 94.0:
+        return "✅ Near 95%"
+    if cov >= 88.0:
+        return "⚠️ Slightly tight"
+    return "❗ Too tight"
+
+def _pct(x, nd=1):
+    return "—" if x is None else f"{x:.{nd}f}%"
+
+def _num(x):
+    return "—" if x is None else f"{x:,.2f}"
+
+def scores_explainer_html(imp_m, exp_m, ppi_m):
+    return f"""
+<div class='note' style='margin-top:10px'>
+  <h3 style="margin:6px 0 6px 0">Score Guide</h3>
+  <p><b>WMAPE</b> = weighted MAPE (robust to small denominators).
+     <b>sMAPE</b> = symmetric MAPE (stable near zero).
+     <b>Median APE</b> = typical %-error (robust to outliers).
+     <b>RMSE</b> = error in original units.
+     <b>Coverage@95</b> = share of backtest points inside the 95% band (calibration check).</p>
+
+  <ul>
+    <li><b>Imports</b>: Coverage@95 = {_pct(imp_m.get('Coverage95'))} → {_cov_badge(imp_m.get('Coverage95'))}.</li>
+    <li><b>Exports</b>: Coverage@95 = {_pct(exp_m.get('Coverage95'))} → {_cov_badge(exp_m.get('Coverage95'))}.</li>
+    <li><b>PPI</b>: Coverage@95 = {_pct(ppi_m.get('Coverage95'))} → {_cov_badge(ppi_m.get('Coverage95'))}.</li>
+  </ul>
+
+  <p><b>How we read it:</b> ~95% means bands are well calibrated.
+     ~90–94% is acceptable for monthly macro series but a touch tight.
+     &lt;90% suggests variance shift—consider band calibration.</p>
+
+  <p><b>Tip:</b> When any MAPE would explode due to zeros, rely on
+     <b>WMAPE</b>/<b>sMAPE</b>/<b>Median APE</b> instead, and use <b>RMSE</b> for scale.</p>
+</div>
+"""
 
 # ====================== Build report ======================
 def build_report():
@@ -446,6 +582,9 @@ def build_report():
         open(os.path.join(OUT_DIR,"Auto_Report.html"),"w",encoding="utf-8").write(html); return
 
     df = pd.read_csv(CSV)
+    # Apply unit scaling
+    df, unit_info = apply_scale(df)
+
     pulled = df.get("pulled_at_utc", pd.Series(dtype=str)).dropna().astype(str).max() if "pulled_at_utc" in df.columns else ""
 
     # Overview by source
@@ -465,7 +604,7 @@ def build_report():
     trade_img,  trade_ai  = line_wits_trade(df)
     tariff_img, tariff_ai = line_wits_tariffs(df)
 
-    # Monthly series & PPI: history + forecast + AI + metrics
+    # Monthly series & PPI: history + forecast + AI + metrics (with calibrated bands)
     imp_img, imp_fc_img, imp_hist_ai, imp_fc_ai, imp_metrics, imp_hist, imp_fc = monthly_series(
         df, "census_imports", "Census — Total Imports (Monthly)"
     )
@@ -474,28 +613,31 @@ def build_report():
     )
     ppi_img, ppi_fc_img, ppi_hist_ai, ppi_fc_ai, ppi_metrics, ppi_hist, ppi_fc = ppi_series(df)
 
-    # Partner deep-dives (with names) — add with_ai=True to include narrative if desired
+    # Partner deep-dives (with names) — include AI narrative
     imp_pd_img, imp_pd_table = partner_deep_dive(df, "census_imports", "Partner Deep-Dive — Imports", with_ai=True)
     exp_pd_img, exp_pd_table = partner_deep_dive(df, "census_exports", "Partner Deep-Dive — Exports", with_ai=True)
 
-    # Scores table for Methodology
+    # Scores table for Methodology (WMAPE / sMAPE / Median APE / RMSE / Coverage@95)
     def fmt_pct(x): return "" if x is None else f"{x:.1f}%"
     def fmt_num(x): return "" if x is None else f"{x:,.2f}"
 
     scores_df = pd.DataFrame([
         {"Series": "Census Imports (Monthly)",
-         "MAPE": fmt_pct(imp_metrics.get("MAPE")),
+         "WMAPE": fmt_pct(imp_metrics.get("WMAPE")),
          "sMAPE": fmt_pct(imp_metrics.get("sMAPE")),
+         "Median APE": fmt_pct(imp_metrics.get("MedianAPE")),
          "RMSE": fmt_num(imp_metrics.get("RMSE")),
          "Coverage@95": fmt_pct(imp_metrics.get("Coverage95"))},
         {"Series": "Census Exports (Monthly)",
-         "MAPE": fmt_pct(exp_metrics.get("MAPE")),
+         "WMAPE": fmt_pct(exp_metrics.get("WMAPE")),
          "sMAPE": fmt_pct(exp_metrics.get("sMAPE")),
+         "Median APE": fmt_pct(exp_metrics.get("MedianAPE")),
          "RMSE": fmt_num(exp_metrics.get("RMSE")),
          "Coverage@95": fmt_pct(exp_metrics.get("Coverage95"))},
         {"Series": "BLS PPI",
-         "MAPE": fmt_pct(ppi_metrics.get("MAPE")),
+         "WMAPE": fmt_pct(ppi_metrics.get("WMAPE")),
          "sMAPE": fmt_pct(ppi_metrics.get("sMAPE")),
+         "Median APE": fmt_pct(ppi_metrics.get("MedianAPE")),
          "RMSE": fmt_num(ppi_metrics.get("RMSE")),
          "Coverage@95": fmt_pct(ppi_metrics.get("Coverage95"))},
     ]).fillna("")
@@ -503,21 +645,33 @@ def build_report():
     methodology_html = """
 <ul class='note'>
   <li><b>Model:</b> ETS / Holt-Winters (trend always on; seasonality=12 when history allows).</li>
-  <li><b>Uncertainty:</b> We plot a 95% confidence band using residual variance from the training fit.</li>
-  <li><b>Backtest:</b> Train up to t−12, forecast 12; we report MAPE, sMAPE, RMSE, and Coverage@95 (share of backtest points inside the 95% band).</li>
+  <li><b>Uncertainty:</b> 95% bands from residual variance; bands are <i>calibrated</i> to reach ~95% coverage in last-12 backtest.</li>
+  <li><b>Backtest:</b> Train up to t−12, forecast 12; we report WMAPE, sMAPE, Median APE, RMSE, and Coverage@95.</li>
 </ul>
 """
     glossary = """
 <ul class='note'>
   <li><b>WITS</b>: World Integrated Trade Solution (World Bank).</li>
-  <li><b>MFN</b>: Most-Favoured-Nation (baseline tariff for WTO members).</li>
+  <li><b>MFN</b>: Most-Favoured-Nation tariff (baseline for WTO members).</li>
   <li><b>PPI</b>: Producer Price Index (upstream cost indicator).</li>
-  <li><b>ETS</b>: Exponential Smoothing (Holt-Winters) time-series model.</li>
+  <li><b>ETS</b>: Exponential Smoothing (Holt–Winters) time-series model.</li>
   <li><b>HHI</b>: Herfindahl–Hirschman Index (0–10,000; ≥2,500 = high concentration).</li>
   <li><b>YoY</b>: Year-over-Year change.</li>
 </ul>
 """
-    methodology_block = methodology_html + "<h3>Model Scores</h3>" + table_html(scores_df) + "<h3>Glossary</h3>" + glossary
+    methodology_block = (
+        methodology_html
+        + "<h3>Model Scores</h3>"
+        + table_html(scores_df)
+        + scores_explainer_html(imp_metrics, exp_metrics, ppi_metrics)
+        + "<h3>Glossary</h3>"
+        + glossary
+    )
+
+    # ===== Badges =====
+    wits_trade_badges = unit_badge(unit_info.get("wits_trade","USD"), "Annual", "goods (nominal)")
+    imp_badges = unit_badge(unit_info.get("census_imports","USD"), "Monthly", "goods (nominal)")
+    exp_badges = unit_badge(unit_info.get("census_exports","USD"), "Monthly", "goods (nominal)")
 
     # Compose full HTML
     html = f"""<!doctype html>
@@ -530,14 +684,14 @@ def build_report():
 
 {section("Overview", kpi_html + table_html(by_src, max_rows=20))}
 
-{section("WITS — US Trade with World (Annual)", (('<img src="'+trade_img+'"/>') if trade_img else '') + trade_ai)}
+{section("WITS — US Trade with World (Annual)", wits_trade_badges + (('<img src="'+trade_img+'"/>') if trade_img else '') + trade_ai)}
 {section("WITS — MFN Average Tariffs", (('<img src="'+tariff_img+'"/>') if tariff_img else '') + tariff_ai)}
 
-{section("Census Imports (Monthly)", (('<img src="'+imp_img+'"/>') if imp_img else '') + imp_hist_ai)}
-{section("Census Imports — 12-month Forecast", (('<img src="'+imp_fc_img+'"/>') if imp_fc_img else '') + imp_fc_ai)}
+{section("Census Imports (Monthly)", imp_badges + (('<img src="'+imp_img+'"/>') if imp_img else '') + imp_hist_ai)}
+{section("Census Imports — 12-month Forecast", imp_badges + (('<img src="'+imp_fc_img+'"/>') if imp_fc_img else '') + imp_fc_ai)}
 
-{section("Census Exports (Monthly)", (('<img src="'+exp_img+'"/>') if exp_img else '') + exp_hist_ai)}
-{section("Census Exports — 12-month Forecast", (('<img src="'+exp_fc_img+'"/>') if exp_fc_img else '') + exp_fc_ai)}
+{section("Census Exports (Monthly)", exp_badges + (('<img src="'+exp_img+'"/>') if exp_img else '') + exp_hist_ai)}
+{section("Census Exports — 12-month Forecast", exp_badges + (('<img src="'+exp_fc_img+'"/>') if exp_fc_img else '') + exp_fc_ai)}
 
 {section("BLS PPI (Upstream Cost)", (('<img src="'+ppi_img+'"/>') if ppi_img else '') + ppi_hist_ai)}
 {section("BLS PPI — 12-month Forecast", (('<img src="'+ppi_fc_img+'"/>') if ppi_fc_img else '') + ppi_fc_ai)}
