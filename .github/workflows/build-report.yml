@@ -45,10 +45,12 @@ jobs:
           SSC_CACHE_DIR: ${{ github.workspace }}/.ssc_cache
         run: |
           python ssc_pipeline/build_report.py
+          test -f ssc_pipeline/Auto_Report.html || (echo "Report HTML not found" && exit 1)
           mkdir -p public
           cp ssc_pipeline/Auto_Report.html public/index.html
           echo "== HEAD of generated HTML =="
-          sed -n '1,20p' public/index.html || true
+          sed -n '1,25p' public/index.html || true
+
 
       - name: Upload artifact for Pages
         uses: actions/upload-pages-artifact@v3
