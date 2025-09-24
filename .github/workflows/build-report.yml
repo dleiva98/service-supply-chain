@@ -43,8 +43,9 @@ jobs:
       - name: Build report (always produce HTML)
         env:
           SSC_ROOT: ${{ github.workspace }}
-          SSC_CACHE_DIR: ${{ github.workspace }}/.ssc_cache
+          SSC_USE_AI: ${{ vars.SSC_USE_AI }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
         shell: bash
         run: |
           set -e
