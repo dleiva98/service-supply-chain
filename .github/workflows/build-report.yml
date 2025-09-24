@@ -43,9 +43,9 @@ jobs:
       - name: Build report (always produce HTML)
         env:
           SSC_ROOT: ${{ github.workspace }}
-          SSC_USE_AI: ${{ vars.SSC_USE_AI }}
+          SSC_USE_AI: "1"
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+          OPENAI_MODEL: gpt-4o-mini
         shell: bash
         run: |
           set -e
