@@ -216,10 +216,10 @@ def build_report():
             wt["kind"] = np.where(wt["indicator"].eq("MPRT-TRD-VL"), "Imports", "Exports")
             wt = wt[(wt["partner"].astype(str).str.upper()=="WLD") & (wt["product"].astype(str).str.lower()=="total")]
             g = wt.groupby(["year","kind"], as_index=False)["value_usd"].sum().dropna()
-            for k, sub in g.pivot(index="year", columns="kind", values="value_usd").items():
-                # k is column name; sub is a Series
-                ts = pd.Series(sub).dropna()
-                fig = plot_series(ts.index, f"WITS — {k} (Annual)", "USD (Billions)", f"wits_{k.lower()}.png")
+            wide = g.pivot(index="year", columns="kind", values="value_usd").sort_index()
+            for k in wide.columns:
+                ts = wide[k].dropna()              # ts is a Series indexed by year
+                _ = plot_series(ts, f"WITS — {k} (Annual)", "USD (Billions)", f"wits_{k.lower()}.png")
             # Headline
             latest = g[g["year"]==g["year"].max()].groupby("kind")["value_usd"].sum()
             html += [h(2, "WITS (Annual, USD)"),
