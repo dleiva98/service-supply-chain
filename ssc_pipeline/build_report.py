@@ -25,32 +25,14 @@ PARTNER_NAME = {
     "ARG":"Argentina", "CHL":"Chile", "PER":"Peru", "COL":"Colombia",
 }
 
-# ---- Unit registry (scale raw values -> USD) ----
+# ---- Unit registry (display badges only; numeric scaling should come from sources.py) ----
 UNIT_REGISTRY = {
-    # APIs commonly return "thousands USD" for flows -> scale to USD
-    "wits_trade":     {"scale": 1e3, "unit": "USD"},
-    "census_imports": {"scale": 1e3, "unit": "USD"},
-    "census_exports": {"scale": 1e3, "unit": "USD"},
-    # Tariffs are in %; PPI is an index
-    "wits_tariff": {"scale": 1.0, "unit": "percent"},
-    "bls_ppi":     {"scale": 1.0, "unit": "index"},
+    "wits_trade":     {"unit": "USD",    "freq": "Annual",  "coverage": "goods (nominal)"},
+    "census_imports": {"unit": "USD",    "freq": "Monthly", "coverage": "goods (nominal)"},
+    "census_exports": {"unit": "USD",    "freq": "Monthly", "coverage": "goods (nominal)"},
+    "wits_tariff":    {"unit": "percent","freq": "Annual",  "coverage": "goods (nominal)"},
+    "bls_ppi":        {"unit": "index",  "freq": "Monthly", "coverage": "domestic prices"},
 }
-
-def apply_scale(df):
-    """Scale numeric value column based on source; return (df_scaled, unit_info_map)."""
-    if "source" not in df.columns:
-        return df, {}
-    info = {}
-    out = df.copy()
-    for src, meta in UNIT_REGISTRY.items():
-        mask = out["source"].eq(src)
-        if not mask.any():
-            continue
-        v = choose_numcol(out.loc[mask], ("ALL_VAL_MO","Value","value"))
-        if v:
-            out.loc[mask, v] = pd.to_numeric(out.loc[mask, v], errors="coerce") * meta["scale"]
-            info[src] = meta["unit"]
-    return out, info
 
 def unit_badge(unit, freq, coverage="goods (nominal)"):
     return (
@@ -135,37 +117,60 @@ def ai_narrative(title, context_dict, max_tokens=450):
         return f"({title}: AI error: {e})"
 
 # ====================== Forecasting & metrics ======================
+def _future_months_from_last(last_index, periods):
+    """Return a DatetimeIndex of month starts for the next `periods` months after last_index."""
+    if isinstance(last_index, pd.Period) and last_index.freqstr.upper().startswith("M"):
+        start = last_index.to_timestamp() + pd.offsets.MonthBegin(1)
+    elif isinstance(last_index, pd.Timestamp):
+        start = pd.Timestamp(year=last_index.year, month=last_index.month, day=1) + pd.offsets.MonthBegin(1)
+    else:
+        # Fallback: assume 'today' anchored if index is unknown
+        today = pd.Timestamp.today().normalize()
+        start = pd.Timestamp(year=today.year, month=today.month, day=1) + pd.offsets.MonthBegin(1)
+    return pd.date_range(start=start, periods=periods, freq="MS")
+
 def ets_point_forecast_and_sd(series: pd.Series, periods=12):
     """
     Forecast point values and return (fc_df, resid_sd).
-    Safe fallback if statsmodels is missing.
+    Always constructs proper monthly future dates based on the last observed point.
     """
-    s = series.dropna().astype(float)
+    s = series.dropna().astype(float).copy()
     if len(s) < 6:
-        return (pd.DataFrame({"date": [], "yhat": []}),
-                float(pd.Series(s).std(ddof=1)) if len(s) > 1 else 0.0)
+        dates = _future_months_from_last(s.index[-1], periods) if len(s) else pd.date_range(pd.Timestamp.today(), periods=periods, freq="MS")
+        std_val  = float(pd.Series(s).tail(12).std(ddof=1)) if len(s)>=12 else float(pd.Series(s).std(ddof=1)) if len(s) else 0.0
+        mean_val = float(pd.Series(s).tail(12).mean()) if len(s)>=12 else float(pd.Series(s).mean()) if len(s) else 0.0
+        fc   = pd.DataFrame({"date": dates, "yhat": [mean_val]*periods})
+        return fc, std_val
 
     try:
         from statsmodels.tsa.holtwinters import ExponentialSmoothing
+        # Ensure we keep the index type (PeriodIndex or DatetimeIndex) and sort
+        s = s.copy()
+        s.index = pd.PeriodIndex(s.index, freq="M") if not isinstance(s.index, (pd.PeriodIndex, pd.DatetimeIndex)) else s.index
+        s = s.sort_index()
+
         seasonal = "add" if len(s) >= 24 else None
         m = 12 if seasonal else None
         model = ExponentialSmoothing(
             s, trend="add", seasonal=seasonal, seasonal_periods=m, initialization_method="estimated"
         ).fit(optimized=True)
-        f = model.forecast(periods)
-        resid = getattr(model, "resid", s - model.fittedvalues)
+
+        # statsmodels returns a Series without guaranteed calendar index → we build the dates ourselves
+        future_dates = _future_months_from_last(s.index[-1], periods)
+        f_vals = model.forecast(periods)
+        f_vals = np.asarray(f_vals).reshape(-1)
+        fc = pd.DataFrame({"date": future_dates, "yhat": f_vals})
+
+        resid = getattr(model, "resid", (s.astype(float) - model.fittedvalues.astype(float)))
         resid_sd = float(np.nanstd(resid, ddof=1)) if len(resid) > 1 else float(np.nanstd(s))
-        dates = f.index.to_timestamp() if hasattr(f.index, "to_timestamp") else pd.to_datetime(f.index)
-        fc = pd.DataFrame({"date": dates, "yhat": f.values})
         return fc, resid_sd
+
     except Exception:
         # Fallback: flat mean ± 1σ on last 12 months
+        future_dates = _future_months_from_last(series.index[-1], periods)
         mean_val = float(pd.Series(s).tail(12).mean()) if len(s)>=12 else float(pd.Series(s).mean())
         std_val  = float(pd.Series(s).tail(12).std(ddof=1)) if len(s)>=12 else float(pd.Series(s).std(ddof=1))
-        last = s.index[-1]
-        start = last.to_timestamp() if hasattr(last, "to_timestamp") else pd.Timestamp(last)
-        dates = pd.date_range(start=start + pd.offsets.MonthBegin(1), periods=periods, freq="MS")
-        fc   = pd.DataFrame({"date": dates, "yhat": [mean_val]*periods})
+        fc   = pd.DataFrame({"date": future_dates, "yhat": [mean_val]*periods})
         return fc, std_val
 
 def ets_forecast_with_bands(series: pd.Series, periods=12, band_multiplier=1.0):
@@ -188,10 +193,15 @@ def band_multiplier_for_target(series: pd.Series, target=95.0, periods=12):
     """
     s = series.dropna().astype(float)
     if len(s) < 24:
-        return 1.0, None  # not enough data to calibrate
+        return 1.0, None
 
     hist = s.iloc[:-12]
     true = s.iloc[-12:]
+
+    # Make sure indices are regular monthly
+    if not isinstance(hist.index, (pd.PeriodIndex, pd.DatetimeIndex)):
+        hist.index = pd.PeriodIndex(hist.index, freq="M")
+    hist = hist.sort_index()
     fc_hist, resid_sd = ets_point_forecast_and_sd(hist, periods=12)
     if fc_hist.empty:
         return 1.0, None
@@ -201,7 +211,7 @@ def band_multiplier_for_target(series: pd.Series, target=95.0, periods=12):
     best_m = 1.0
     best_cov = None
     best_err = float("inf")
-    for m in np.linspace(0.8, 2.0, 25):  # search 0.8x … 2.0x
+    for m in np.linspace(0.8, 2.0, 25):
         lower = y - (1.96 * m * resid_sd)
         upper = y + (1.96 * m * resid_sd)
         cov = float(((true >= lower) & (true <= upper)).mean()) * 100.0
@@ -216,7 +226,6 @@ def compute_error_metrics(true, pred):
     pred = pd.Series(pred).astype(float)
     eps = 1e-9
     ae = (true - pred).abs()
-    # Robust % errors
     smape = float((ae / ((true.abs() + pred.abs())/2.0 + eps)).mean())*100.0
     median_ape = float((ae / (true.abs() + eps)).median())*100.0
     wmape = float(ae.sum() / (true.abs().sum() + eps))*100.0
@@ -230,6 +239,11 @@ def backtest_metrics_with_coverage(series: pd.Series, band_multiplier=1.0):
         return {"sMAPE": None, "MedianAPE": None, "WMAPE": None, "RMSE": None, "Coverage95": None, "n": 0}
     hist = s.iloc[:-12]
     true = s.iloc[-12:]
+
+    if not isinstance(hist.index, (pd.PeriodIndex, pd.DatetimeIndex)):
+        hist.index = pd.PeriodIndex(hist.index, freq="M")
+    hist = hist.sort_index()
+
     fc, band = ets_forecast_with_bands(hist, periods=12, band_multiplier=band_multiplier)
     pred = pd.Series(fc["yhat"].values, index=true.index)
     cov = None
@@ -333,7 +347,7 @@ def line_wits_tariffs(df):
 def monthly_series(df, source_name, title):
     m = df[df["source"].eq(source_name)].copy()
     if m.empty: return "", "", "", "", {}, pd.DataFrame(), pd.DataFrame()
-    v = choose_numcol(m, ("ALL_VAL_MO","Value","value"))
+    v = choose_numcol(m, ("Value","ALL_VAL_MO","value"))
     if not v: return "", "", "", "", {}, pd.DataFrame(), pd.DataFrame()
     m["ym"] = to_ym(m["time"])
     g = m.groupby("ym")[v].sum().sort_index()
@@ -394,6 +408,10 @@ def ppi_series(df):
         return "", "", "", "", {}, pd.DataFrame(), pd.DataFrame()
     if s.empty: return "", "", "", "", {}, pd.DataFrame(), pd.DataFrame()
 
+    # Ensure index is monthly and sorted (important for future dates)
+    s.index = pd.DatetimeIndex(s.index).to_period("M").to_timestamp()
+    s = s.sort_index()
+
     # Calibrate band multiplier to ≈95% coverage
     bm, cov = band_multiplier_for_target(s, target=95.0, periods=12)
 
@@ -404,7 +422,7 @@ def ppi_series(df):
     ax.grid(True, alpha=.3)
     img_hist = img64(fig)
 
-    # forecast + bands + metrics
+    # forecast + bands + metrics (dates built from last obs → fixes 1970 bug)
     fc, band = ets_forecast_with_bands(s, periods=12, band_multiplier=bm)
     metrics = backtest_metrics_with_coverage(s, band_multiplier=bm)
 
@@ -440,7 +458,7 @@ def partner_deep_dive(df, source_name, title, top=5, with_ai=False):
     if m.empty:
         return "", "<p><em>(no data)</em></p>"
 
-    v = choose_numcol(m, ("ALL_VAL_MO","Value","value"))
+    v = choose_numcol(m, ("Value","ALL_VAL_MO","value"))
     if not v:
         return "", "<p><em>(no data)</em></p>"
 
@@ -574,6 +592,24 @@ def scores_explainer_html(imp_m, exp_m, ppi_m):
 </div>
 """
 
+# ====================== extra sanity: partners vs total ======================
+def partners_vs_total_sanity(df, source_name):
+    """Return (ok, note_html). ok=False if partners sum < 70% of total for last-12."""
+    m = df[df["source"].eq(source_name)].copy()
+    v = choose_numcol(m, ("Value","value","ALL_VAL_MO"))
+    if not v or m.empty:
+        return True, ""
+    m["ym"] = to_ym(m["time"])
+    last12 = m[m["ym"] >= (m["ym"].max() - 11)]
+    total = last12.groupby("ym")[v].sum().sum()
+    if "partner" in last12.columns:
+        by_partner = last12.groupby(["partner","ym"])[v].sum().groupby("ym").sum().sum()
+    else:
+        by_partner = total
+    if total and (by_partner / total) < 0.70:
+        return False, "<p class='note'>Data appears incomplete: partner sum &lt; 70% of total over last 12 months. Narrative suppressed.</p>"
+    return True, ""
+
 # ====================== Build report ======================
 def build_report():
     pathlib.Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
@@ -582,9 +618,6 @@ def build_report():
         open(os.path.join(OUT_DIR,"Auto_Report.html"),"w",encoding="utf-8").write(html); return
 
     df = pd.read_csv(CSV)
-    # Apply unit scaling
-    df, unit_info = apply_scale(df)
-
     pulled = df.get("pulled_at_utc", pd.Series(dtype=str)).dropna().astype(str).max() if "pulled_at_utc" in df.columns else ""
 
     # Overview by source
@@ -642,6 +675,13 @@ def build_report():
          "Coverage@95": fmt_pct(ppi_metrics.get("Coverage95"))},
     ]).fillna("")
 
+    # Clamp absurd % (if any) for display safety
+    def _clamp_pct(s, max_abs=500.0):
+        return s.apply(lambda x: ("" if x=="" else (x if abs(float(x.strip('%'))) <= max_abs else "—")) )
+    for col in ["WMAPE","sMAPE","Median APE","Coverage@95"]:
+        if col in scores_df.columns:
+            scores_df[col] = _clamp_pct(scores_df[col])
+
     methodology_html = """
 <ul class='note'>
   <li><b>Model:</b> ETS / Holt-Winters (trend always on; seasonality=12 when history allows).</li>
@@ -669,9 +709,20 @@ def build_report():
     )
 
     # ===== Badges =====
-    wits_trade_badges = unit_badge(unit_info.get("wits_trade","USD"), "Annual", "goods (nominal)")
-    imp_badges = unit_badge(unit_info.get("census_imports","USD"), "Monthly", "goods (nominal)")
-    exp_badges = unit_badge(unit_info.get("census_exports","USD"), "Monthly", "goods (nominal)")
+    def badges_for(src):
+        meta = UNIT_REGISTRY.get(src, {"unit":"", "freq":"", "coverage":""})
+        return unit_badge(meta["unit"], meta["freq"], meta["coverage"])
+
+    wits_trade_badges = badges_for("wits_trade")
+    imp_badges = badges_for("census_imports")
+    exp_badges = badges_for("census_exports")
+
+    # Narrative gating if partners sum looks incomplete
+    ok_imp, imp_note = partners_vs_total_sanity(df, "census_imports")
+    imp_hist_block = imp_badges + (('<img src="'+imp_img+'"/>') if imp_img else '') + (imp_hist_ai if ok_imp else imp_note)
+
+    ok_exp, exp_note = partners_vs_total_sanity(df, "census_exports")
+    exp_hist_block = exp_badges + (('<img src="'+exp_img+'"/>') if exp_img else '') + (exp_hist_ai if ok_exp else exp_note)
 
     # Compose full HTML
     html = f"""<!doctype html>
@@ -687,10 +738,10 @@ def build_report():
 {section("WITS — US Trade with World (Annual)", wits_trade_badges + (('<img src="'+trade_img+'"/>') if trade_img else '') + trade_ai)}
 {section("WITS — MFN Average Tariffs", (('<img src="'+tariff_img+'"/>') if tariff_img else '') + tariff_ai)}
 
-{section("Census Imports (Monthly)", imp_badges + (('<img src="'+imp_img+'"/>') if imp_img else '') + imp_hist_ai)}
+{section("Census Imports (Monthly)", imp_hist_block)}
 {section("Census Imports — 12-month Forecast", imp_badges + (('<img src="'+imp_fc_img+'"/>') if imp_fc_img else '') + imp_fc_ai)}
 
-{section("Census Exports (Monthly)", exp_badges + (('<img src="'+exp_img+'"/>') if exp_img else '') + exp_hist_ai)}
+{section("Census Exports (Monthly)", exp_hist_block)}
 {section("Census Exports — 12-month Forecast", exp_badges + (('<img src="'+exp_fc_img+'"/>') if exp_fc_img else '') + exp_fc_ai)}
 
 {section("BLS PPI (Upstream Cost)", (('<img src="'+ppi_img+'"/>') if ppi_img else '') + ppi_hist_ai)}
