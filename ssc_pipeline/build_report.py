@@ -128,31 +128,69 @@ def coverage(actual, lo, hi):
     return 100.0 * np.mean(hit)
 
 def ets_forecast(ts, h=12, seasonal=False):
-    """ETS with empirical residual bands & backtest (last 12 OOS)."""
+    """
+    ETS with empirical residual bands & backtest (last 12 OOS).
+    Robust to short/edge cases: falls back to ±1.96*sd bands when residual history is thin.
+    """
     ts = ts.asfreq("M")
+
     # Require at least 2 years for seasonality
     season = 12 if seasonal and len(ts) >= 36 else None
-    model = ExponentialSmoothing(ts, trend="add", seasonal=("add" if season else None), seasonal_periods=season)
+
+    # Fit main model
+    model = ExponentialSmoothing(
+        ts, trend="add", seasonal=("add" if season else None), seasonal_periods=season
+    )
     fit = model.fit(optimized=True, use_brute=True)
-    # residuals
-    resid = ts - fit.fittedvalues.reindex(ts.index)
-    # empirical 95% band (2.5/97.5 quantiles)
-    qlo, qhi = np.nanpercentile(resid.dropna().values, [2.5, 97.5])
+
+    # Residuals and bands (robust)
+    resid = (ts - fit.fittedvalues.reindex(ts.index)).dropna().values
+    if resid.size >= 8:
+        q = np.nanpercentile(resid, [2.5, 97.5])
+        # If numpy returns a scalar by accident, coerce to two numbers
+        if np.ndim(q) == 0:
+            sd = float(np.nanstd(resid, ddof=1)) if resid.size > 1 else float(np.nanstd(ts.values, ddof=1))
+            qlo, qhi = -1.96 * sd, 1.96 * sd
+        else:
+            qlo, qhi = float(q[0]), float(q[1])
+    elif resid.size >= 2:
+        sd = float(np.nanstd(resid, ddof=1))
+        qlo, qhi = -1.96 * sd, 1.96 * sd
+    else:
+        sd = float(np.nanstd(ts.values, ddof=1)) if len(ts.values) > 1 else 0.0
+        qlo, qhi = -1.96 * sd, 1.96 * sd
+
+    # Forecast horizon and bands
     f = fit.forecast(h)
     lo = f + qlo
     hi = f + qhi
 
-    # backtest last 12
+    # ---- Backtest on last 12 (if enough history) ----
     if len(ts) >= 36:
         train = ts.iloc[:-12]
         test  = ts.iloc[-12:]
         season_bt = 12 if seasonal and len(train) >= 36 else None
         m2 = ExponentialSmoothing(train, trend="add", seasonal=("add" if season_bt else None), seasonal_periods=season_bt).fit(optimized=True, use_brute=True)
         fc_bt = m2.forecast(12)
-        resid_bt = train - m2.fittedvalues.reindex(train.index)
-        qlo_bt, qhi_bt = np.nanpercentile(resid_bt.dropna().values, [2.5, 97.5])
+        resid_bt = (train - m2.fittedvalues.reindex(train.index)).dropna().values
+
+        if resid_bt.size >= 8:
+            q_bt = np.nanpercentile(resid_bt, [2.5, 97.5])
+            if np.ndim(q_bt) == 0:
+                sd_bt = float(np.nanstd(resid_bt, ddof=1))
+                qlo_bt, qhi_bt = -1.96 * sd_bt, 1.96 * sd_bt
+            else:
+                qlo_bt, qhi_bt = float(q_bt[0]), float(q_bt[1])
+        elif resid_bt.size >= 2:
+            sd_bt = float(np.nanstd(resid_bt, ddof=1))
+            qlo_bt, qhi_bt = -1.96 * sd_bt, 1.96 * sd_bt
+        else:
+            sd_bt = float(np.nanstd(train.values, ddof=1)) if len(train.values) > 1 else 0.0
+            qlo_bt, qhi_bt = -1.96 * sd_bt, 1.96 * sd_bt
+
         lo_bt = fc_bt + qlo_bt
         hi_bt = fc_bt + qhi_bt
+
         scores = {
             "sMAPE": smape(test.values, fc_bt.values),
             "WMAPE": wmape(test.values, fc_bt.values),
@@ -161,6 +199,7 @@ def ets_forecast(ts, h=12, seasonal=False):
         }
     else:
         scores = {"sMAPE": np.nan, "WMAPE": np.nan, "RMSE": np.nan, "Coverage95": np.nan}
+
     return f, lo, hi, scores
 
 # ---------- Plotters ----------
