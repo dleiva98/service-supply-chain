@@ -565,6 +565,48 @@ def build_report():
     wits = prepare_wits(df)
     cen  = prepare_census(df)
     bls  = prepare_bls(df)
+    # ---------- WITS (Annual, up to last available year) ----------
+    if not wits.empty:
+        # pick trade indicators and then world/total
+        wt = wits[wits["indicator"].isin(["MPRT-TRD-VL", "XPRT-TRD-VL"])].copy()
+        wt = wt[
+            (wt["partner_label"].astype(str).str.upper() == "WLD") &
+            (wt["product_label"].astype(str).str.casefold() == "all")
+        ]
+        if not wt.empty:
+            wt["kind"] = np.where(wt["indicator"].eq("MPRT-TRD-VL"), "Imports (Annual)", "Exports (Annual)")
+            g = wt.groupby(["year", "kind"], as_index=False)["value_usd"].sum().dropna()
+            if not g.empty:
+                wide = g.pivot(index="year", columns="kind", values="value_usd").sort_index()
+
+                html.append(h(2, "WITS — Annual Totals (USD)"))
+                html.append(small("Frequency: Annual • Units: USD (converted from WITS 'US$ Million') • Coverage: Goods (nominal)."))
+
+                for col in wide.columns:
+                    ts = wide[col].dropna()
+                    if ts.empty:
+                        continue
+                    ts2 = pd.Series(ts.values, index=pd.to_datetime(ts.index.astype(str) + "-12-31"))
+                    html.append(plot_series(ts2, f"{col} — WITS (Annual)", "USD",
+                                            f"wits_{col.lower().replace(' ', '_')}.png"))
+                    html.append(ai_explain(
+                        section_title=f"{col} — WITS (Annual)",
+                        freq_unit="Annual, USD",
+                        history=ts2, forecast=None,
+                        extras={"source": "WITS (annual, no forward fill)"},
+                        horizons=[3, 6, 12]
+                    ))
+
+                non_empty = wide.dropna(how="all")
+                if not non_empty.empty:
+                    last_year = int(non_empty.index.max())
+                    bullets = []
+                    for col in wide.columns:
+                        val = wide.loc[last_year, col]
+                        if pd.notna(val):
+                            bullets.append(f"{col} in {last_year}: {human_usd(val)}")
+                    if bullets:
+                        html.append(bullet_list(bullets))
 
     html = []
     html.append("<html><head><meta charset='utf-8'><title>U.S. Trade & Supply Chain Report</title>")
@@ -582,45 +624,6 @@ def build_report():
 
     # Executive overview
     html.append(executive_overview(imports_m, exports_m))
-
-    # ---------- WITS (Annual, up to last available year) ----------
-if not wits.empty:
-    # pick trade indicators and then world/total
-    wt = wits[wits["indicator"].isin(["MPRT-TRD-VL", "XPRT-TRD-VL"])].copy()
-    wt = wt[
-        (wt["partner_label"].astype(str).str.upper() == "WLD") &
-        (wt["product_label"].astype(str).str.casefold() == "all")
-    ]
-    if not wt.empty:
-        wt["kind"] = np.where(wt["indicator"].eq("MPRT-TRD-VL"), "Imports (Annual)", "Exports (Annual)")
-        g = wt.groupby(["year", "kind"], as_index=False)["value_usd"].sum().dropna()
-
-        if not g.empty:
-            wide = g.pivot(index="year", columns="kind", values="value_usd").sort_index()
-            html.append(h(2, "WITS — Annual Totals (USD)"))
-            html.append(small("Frequency: Annual • Units: USD (converted from WITS 'US$ Million') • Coverage: Goods (nominal)."))
-            for col in wide.columns:
-                ts = wide[col].dropna()
-                if ts.empty:
-                    continue
-                ts2 = pd.Series(ts.values, index=pd.to_datetime(ts.index.astype(str) + "-12-31"))
-                html.append(plot_series(ts2, f"{col} — WITS (Annual)", "USD", f"wits_{col.lower().replace(' ', '_')}.png"))
-                html.append(ai_explain(
-                    section_title=f"{col} — WITS (Annual)",
-                    freq_unit="Annual, USD",
-                    history=ts2, forecast=None,
-                    extras={"source": "WITS (annual, no forward fill)"},
-                    horizons=[3, 6, 12]
-                ))
-            if not wide.dropna(how="all").empty:
-                last_year = wide.dropna(how="all").index.max()
-                bullets = []
-                for col in wide.columns:
-                    val = wide.loc[last_year, col]
-                    if pd.notna(val):
-                        bullets.append(f"{col} in {int(last_year)}: {human_usd(val)}")
-                if bullets:
-                    html.append(bullet_list(bullets))
 
 
     # ---------- Census: Imports (Monthly) ----------
