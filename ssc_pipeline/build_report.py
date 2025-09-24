@@ -40,8 +40,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # you can set gpt-4o
 AI_TIMEOUT = int(os.getenv("SSC_AI_TIMEOUT", "45"))
 
 # Conversions
-WITS_TO_USD = 1.0  
-
+WITS_TO_USD = 1_000_000
 # Named deep-dive partners (canonical labels)
 FOCUS_PARTNERS = [
     "Mexico", "Canada", "China", "Japan", "Germany", "United Kingdom", "India"
