@@ -177,63 +177,140 @@ def coverage(actual: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> float:
 
 def ets_forecast(ts: pd.Series, h: int = 12, seasonal: bool = True):
     """
-    ETS/Holt-Winters with robust confidence bands and 12m backtest.
-    - Uses seasonality=12 if >=36 monthly points.
-    - 95% bands via residual 2.5/97.5 quantiles; fallback ±1.96σ if thin.
+    Robust ETS/Holt-Winters forecaster with graceful fallbacks.
+
+    - Cleans the series to a monthly grid and drops NAs.
+    - Uses additive trend; seasonality=12 ONLY if >=36 points after cleaning.
+    - If fitting fails (or series too short), falls back to:
+        Holt → SimpleExpSmoothing → Naïve (last value repeated).
+    - 95% bands from empirical residual quantiles when available; otherwise ±1.96*sd.
+    - Backtest on last 12 months only if we have >=36 points post-clean.
+
+    Returns: (f, lo, hi, scores) where scores has keys sMAPE, WMAPE, RMSE, Coverage@95.
     """
-    ts = ts.asfreq("M")
-    season = 12 if seasonal and len(ts) >= 36 else None
+    # ---- Clean & regularize ----
+    s = ts.copy()
+    if not isinstance(s.index, pd.DatetimeIndex):
+        s.index = pd.to_datetime(s.index, errors="coerce")
+    s = s.dropna().sort_index()
 
-    model = ExponentialSmoothing(ts, trend="add", seasonal=("add" if season else None), seasonal_periods=season)
-    fit = model.fit(optimized=True, use_brute=True)
+    # if duplicates → aggregate (mean; for dollar totals you already pass aggregated series)
+    if s.index.has_duplicates:
+        s = s.groupby(s.index).mean()
 
-    resid = (ts - fit.fittedvalues.reindex(ts.index)).dropna().values
-    if resid.size >= 8:
-        q = np.nanpercentile(resid, [2.5, 97.5])
-        if np.ndim(q) == 0:
-            sd = float(np.nanstd(resid, ddof=1))
-            qlo, qhi = -1.96 * sd, 1.96 * sd
-        else:
-            qlo, qhi = float(q[0]), float(q[1])
-    elif resid.size >= 2:
-        sd = float(np.nanstd(resid, ddof=1))
-        qlo, qhi = -1.96 * sd, 1.96 * sd
-    else:
-        sd = float(np.nanstd(ts.values, ddof=1)) if len(ts.values) > 1 else 0.0
-        qlo, qhi = -1.96 * sd, 1.96 * sd
+    # put on a monthly grid
+    s = s.resample("M").mean()
+    s = s.dropna()
 
-    f = fit.forecast(h)
-    lo = f + qlo
-    hi = f + qhi
+    # If basically empty, return a flat forecast with NaN scores
+    if len(s) == 0:
+        idx_f = pd.date_range(pd.Timestamp.today().normalize() + pd.offsets.MonthEnd(1), periods=h, freq="M")
+        f = pd.Series([np.nan]*h, index=idx_f)
+        return f, f, f, {"sMAPE": float("nan"), "WMAPE": float("nan"), "RMSE": float("nan"), "Coverage@95": float("nan")}
 
-    if len(ts) >= 36:
-        train = ts.iloc[:-12]
-        test  = ts.iloc[-12:]
-        season_bt = 12 if seasonal and len(train) >= 36 else None
-        m2 = ExponentialSmoothing(train, trend="add", seasonal=("add" if season_bt else None), seasonal_periods=season_bt).fit(optimized=True, use_brute=True)
-        fc_bt = m2.forecast(12)
-        resid_bt = (train - m2.fittedvalues.reindex(train.index)).dropna().values
+    # Helper to build simple bands from sd
+    def bands_from_sd(base: pd.Series, sd: float):
+        return base - 1.96*sd, base + 1.96*sd
 
-        if resid_bt.size >= 8:
-            q_bt = np.nanpercentile(resid_bt, [2.5, 97.5])
-            if np.ndim(q_bt) == 0:
-                sd_bt = float(np.nanstd(resid_bt, ddof=1)); qlo_bt, qhi_bt = -1.96*sd_bt, 1.96*sd_bt
+    # Decide seasonality
+    use_season = (seasonal and len(s) >= 36)
+    season_periods = 12 if use_season else None
+
+    # Try full ETS
+    f = lo = hi = None
+    scores = {"sMAPE": float("nan"), "WMAPE": float("nan"),
+              "RMSE": float("nan"), "Coverage@95": float("nan")}
+    fitted = None
+
+    # Fit with progressive fallback
+    try:
+        model = ExponentialSmoothing(s, trend="add",
+                                     seasonal=("add" if use_season else None),
+                                     seasonal_periods=season_periods)
+        fitted = model.fit(optimized=True, use_brute=True)
+    except Exception:
+        # Try Holt (no seasonality)
+        try:
+            model = ExponentialSmoothing(s, trend="add", seasonal=None)
+            fitted = model.fit(optimized=True, use_brute=True)
+        except Exception:
+            # Try simple exponential smoothing (no trend/season)
+            try:
+                model = ExponentialSmoothing(s, trend=None, seasonal=None)
+                fitted = model.fit(optimized=True, use_brute=True)
+            except Exception:
+                fitted = None
+
+    # Forecast + bands
+    if fitted is not None:
+        f_vals = fitted.forecast(h)
+        # ensure index continues monthly after last observed
+        idx_f = pd.date_range(s.index[-1] + pd.offsets.MonthEnd(1), periods=h, freq="M")
+        f = pd.Series(f_vals.values, index=idx_f)
+
+        # Residuals for bands
+        resid = (s - fitted.fittedvalues.reindex(s.index)).dropna().values
+        if resid.size >= 8:
+            q = np.nanpercentile(resid, [2.5, 97.5])
+            if np.ndim(q) == 0:
+                sd = float(np.nanstd(resid, ddof=1))
+                qlo, qhi = -1.96*sd, 1.96*sd
             else:
-                qlo_bt, qhi_bt = float(q_bt[0]), float(q_bt[1])
-        elif resid_bt.size >= 2:
-            sd_bt = float(np.nanstd(resid_bt, ddof=1)); qlo_bt, qhi_bt = -1.96*sd_bt, 1.96*sd_bt
+                qlo, qhi = float(q[0]), float(q[1])
         else:
-            sd_bt = float(np.nanstd(train.values, ddof=1)) if len(train.values)>1 else 0.0
-            qlo_bt, qhi_bt = -1.96*sd_bt, 1.96*sd_bt
+            sd = float(np.nanstd(resid, ddof=1)) if resid.size > 1 else float(np.nanstd(s.values, ddof=1))
+            qlo, qhi = -1.96*sd, 1.96*sd
 
-        scores = {
-            "sMAPE": smape(test.values, fc_bt.values),
-            "WMAPE": wmape(test.values, fc_bt.values),
-            "RMSE": float(np.sqrt(np.nanmean((test.values - fc_bt.values)**2))),
-            "Coverage@95": coverage(test.values, (fc_bt+qlo_bt).values, (fc_bt+qhi_bt).values),
-        }
+        lo = f + qlo
+        hi = f + qhi
+
+        # Backtest (12m) if enough history
+        if len(s) >= 36:
+            train = s.iloc[:-12]
+            test  = s.iloc[-12:]
+            # Mirror fallback strategy for backtest
+            fitted_bt = None
+            for cfg in [("add", use_season and len(train) >= 36),
+                        ("add", False),
+                        (None, False)]:
+                tr, sez = cfg
+                try:
+                    m2 = ExponentialSmoothing(train, trend=tr,
+                                              seasonal=("add" if sez else None),
+                                              seasonal_periods=(12 if sez else None))
+                    fitted_bt = m2.fit(optimized=True, use_brute=True)
+                    break
+                except Exception:
+                    continue
+            if fitted_bt is not None:
+                fc_bt = fitted_bt.forecast(12)
+                resid_bt = (train - fitted_bt.fittedvalues.reindex(train.index)).dropna().values
+                if resid_bt.size >= 8:
+                    q_bt = np.nanpercentile(resid_bt, [2.5, 97.5])
+                    if np.ndim(q_bt) == 0:
+                        sd_bt = float(np.nanstd(resid_bt, ddof=1)); qlo_bt, qhi_bt = -1.96*sd_bt, 1.96*sd_bt
+                    else:
+                        qlo_bt, qhi_bt = float(q_bt[0]), float(q_bt[1])
+                else:
+                    sd_bt = float(np.nanstd(resid_bt, ddof=1)) if resid_bt.size>1 else float(np.nanstd(train.values, ddof=1))
+                    qlo_bt, qhi_bt = -1.96*sd_bt, 1.96*sd_bt
+
+                lo_bt = fc_bt + qlo_bt
+                hi_bt = fc_bt + qhi_bt
+
+                scores = {
+                    "sMAPE": smape(test.values, fc_bt.values),
+                    "WMAPE": wmape(test.values, fc_bt.values),
+                    "RMSE": float(np.sqrt(np.nanmean((test.values - fc_bt.values)**2))),
+                    "Coverage@95": coverage(test.values, lo_bt.values, hi_bt.values),
+                }
     else:
-        scores = {"sMAPE": float("nan"), "WMAPE": float("nan"), "RMSE": float("nan"), "Coverage@95": float("nan")}
+        # Final fallback: naive forecast (repeat last value)
+        last = float(s.iloc[-1])
+        idx_f = pd.date_range(s.index[-1] + pd.offsets.MonthEnd(1), periods=h, freq="M")
+        f = pd.Series(last, index=idx_f)
+        sd = float(np.nanstd(s.values, ddof=1)) if len(s.values) > 1 else 0.0
+        lo, hi = bands_from_sd(f, sd)
 
     return f, lo, hi, scores
 
