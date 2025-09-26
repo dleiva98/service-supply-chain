@@ -1,15 +1,14 @@
 # ssc_pipeline/build_report.py
 # Executive-grade U.S. Trade & Supply Chain report (HTML):
-# - WITS scaling fixed (US$ Mil -> USD), annual only (no forward-fill)
-# - Census monthly USD enforced (rejects "units" pulls)
-# - Partners plausibility guard + named partners (MX, CA, CN, JP, DE, UK, IN)
-# - AI narratives (3/6/12-month outlooks) when OPENAI key present
-# - Base64-embedded plots (Pages-safe)
-# - Robust ETS forecasting with calibration/backtests
-# - Clear score explanations (for non-economists)
-# - Data-quality panels per chart
+# - Uses main.csv OR auto-refreshes from sources.py if data is stale/incomplete
+# - WITS kept annual (no forward-fill) & correctly filtered to World/Total
+# - Census monthly in USD, with partner plausibility guard + named deep-dives
+# - AI narratives via GPT (3/6/12-month outlook, uncertainty, calibration)
+# - Robust ETS forecasting with backtests (sMAPE/WMAPE/RMSE/Coverage@95)
+# - Freshness & completeness banners (no more 2019/2022 tails)
+# - Base64-embedded plots (works on static hosts)
 
-import os, io, json, base64, math, warnings
+import os, io, json, base64, math, warnings, sys, importlib.util
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List
 
@@ -17,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 import matplotlib
-matplotlib.use("Agg")  # headless for CI
+matplotlib.use("Agg")  # headless for CI/CD
 import matplotlib.pyplot as plt
 plt.rcParams["axes.grid"] = True
 plt.rcParams["figure.dpi"] = 150
@@ -36,17 +35,21 @@ HTML_PATH = OUT_DIR / "Auto_Report.html"
 # Optional AI layer
 USE_AI = os.getenv("SSC_USE_AI", "0") == "1"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # you can set gpt-4o
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # set to "gpt-4o" if you prefer
 AI_TIMEOUT = int(os.getenv("SSC_AI_TIMEOUT", "45"))
 
-# Conversions
-WITS_TO_USD = 1_000_000
+# Allow online refresh (fallback to sources.py) if CSV is stale/incomplete
+ALLOW_REFRESH = os.getenv("SSC_ALLOW_ONLINE_REFRESH", "1") == "1"
+
+# WITS scaling: your sources.py already scales WITS trade to USD → keep multiplier = 1.0 here
+WITS_TO_USD = 1.0
+
 # Named deep-dive partners (canonical labels)
 FOCUS_PARTNERS = [
     "Mexico", "Canada", "China", "Japan", "Germany", "United Kingdom", "India"
 ]
 
-# Micro/implausible partners (to flag if they bubble to top)
+# Micro/implausible partners to flag if they bubble up
 SUSPECT_PARTNERS = {
     "NIUE","COMOROS","COCOS (KEELING) ISLANDS","KOREA, NORTH",
     "WALLIS AND FUTUNA","SVALBARD, JAN MAYEN ISLAND","NAURU",
@@ -108,6 +111,12 @@ def save_and_embed(fig_name: str) -> str:
     return embed_png(path)
 
 # ----------------------------
+# Logging helper
+# ----------------------------
+def info(msg: str):
+    print(f"[build_report] {msg}")
+
+# ----------------------------
 # Load & normalize data
 # ----------------------------
 def load_main() -> pd.DataFrame:
@@ -125,7 +134,6 @@ def load_main() -> pd.DataFrame:
 def normalize_partner_label(s: pd.Series) -> pd.Series:
     lab = s.fillna("").astype(str).str.strip()
     up = lab.str.upper()
-    # quick map for synonyms
     mapped = lab.copy()
     for k, v in PARTNER_NORMALIZE.items():
         mapped[up.eq(k)] = v
@@ -134,9 +142,9 @@ def normalize_partner_label(s: pd.Series) -> pd.Series:
 def prepare_wits(df: pd.DataFrame) -> pd.DataFrame:
     w = df[df["source"].isin(["wits_trade","wits_tariff"])].copy()
     if w.empty: return w
-    # annual year from 'time' (integer)
     w["year"] = pd.to_numeric(w.get("time"), errors="coerce").round().astype("Int64")
     v = pd.to_numeric(w.get("value"), errors="coerce")
+    # value already scaled to USD in sources.py for trade; tariffs are percent
     is_trade = w["indicator"].astype(str).str.contains("TRD-VL", case=False, na=False)
     w["value_usd"] = np.where(is_trade, v * WITS_TO_USD, v)
     w["partner_label"] = normalize_partner_label(w.get("partner", ""))
@@ -158,7 +166,7 @@ def prepare_census(df: pd.DataFrame) -> pd.DataFrame:
         if cand in c.columns: code_col = cand; break
     if code_col is None: code_col = "partner"
 
-    # drop totals/world
+    # drop totals/world rows
     names_up = c[name_col].astype(str).str.upper()
     drop_mask = names_up.str.contains("TOTAL") | names_up.str.contains("ALL COUNTRIES") | names_up.eq("WLD")
     drop_mask |= c[code_col].astype(str).str.upper().isin(["ALL","WLD","000","TOT","0"])
@@ -190,11 +198,10 @@ def prepare_census(df: pd.DataFrame) -> pd.DataFrame:
 
     # partner label
     c["partner_label"] = normalize_partner_label(c[name_col])
-    # filter outrageous negatives or NA dates
+    # filter negatives/NA dates
     c = c.dropna(subset=["date","value_usd"])
     c = c[c["value_usd"] >= 0]  # imports/exports in USD shouldn't be negative
 
-    # if series are suspiciously tiny (e.g., thousands only), leave to sanity panel + flags
     return c.sort_values("date")
 
 def prepare_bls(df: pd.DataFrame) -> pd.DataFrame:
@@ -209,6 +216,127 @@ def prepare_bls(df: pd.DataFrame) -> pd.DataFrame:
     b["value"] = pd.to_numeric(b["value"], errors="coerce")
     b = b.dropna(subset=["date","value"]).sort_values("date")
     return b
+
+# ----------------------------
+# Try on-the-fly refresh from sources.py if CSV is stale/incomplete
+# ----------------------------
+def _import_sources():
+    """
+    Try to import sources from package or via direct file import.
+    Returns dict with callables or {} if not available.
+    """
+    # 1) Try package import (ssc_pipeline.sources)
+    try:
+        from ssc_pipeline.sources import wits_trade_data, wits_tariff_data, census_monthly_by_country, bls_series
+        return {
+            "wits_trade_data": wits_trade_data,
+            "wits_tariff_data": wits_tariff_data,
+            "census_monthly_by_country": census_monthly_by_country,
+            "bls_series": bls_series,
+        }
+    except Exception:
+        pass
+
+    # 2) Try explicit path import
+    sp = ROOT / "ssc_pipeline" / "ssc_pipeline" / "sources.py"
+    if not sp.exists():
+        return {}
+    spec = importlib.util.spec_from_file_location("ssc_sources_fallback", sp.as_posix())
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)  # type: ignore
+        return {
+            "wits_trade_data": getattr(mod, "wits_trade_data", None),
+            "wits_tariff_data": getattr(mod, "wits_tariff_data", None),
+            "census_monthly_by_country": getattr(mod, "census_monthly_by_country", None),
+            "bls_series": getattr(mod, "bls_series", None),
+        }
+    except Exception:
+        return {}
+
+def refresh_if_needed(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    If Census monthly looks stale (< last 60 days) or incomplete (<5k rows),
+    attempt an online refresh via sources.py and merge in-memory.
+    """
+    if not ALLOW_REFRESH:
+        return df
+
+    try:
+        cen = prepare_census(df)
+    except Exception:
+        cen = pd.DataFrame()
+
+    stale = False
+    incomplete = False
+    if not cen.empty:
+        try:
+            last_dt = pd.to_datetime(cen["date"].max())
+            if (pd.Timestamp.today().normalize() - last_dt) > pd.Timedelta(days=60):
+                stale = True
+        except Exception:
+            stale = True
+        # Expect many partner rows across years; <5k is a red flag
+        if cen.shape[0] < 5000:
+            incomplete = True
+    else:
+        stale = True; incomplete = True
+
+    if not (stale or incomplete):
+        info("CSV looks fresh/complete enough; skipping online refresh.")
+        return df
+
+    info(f"CSV appears stale={stale} incomplete={incomplete}. Trying to refresh from sources.py ...")
+    funcs = _import_sources()
+    req = ("wits_trade_data" in funcs and callable(funcs["wits_trade_data"]) and
+           "wits_tariff_data" in funcs and callable(funcs["wits_tariff_data"]) and
+           "census_monthly_by_country" in funcs and callable(funcs["census_monthly_by_country"]) and
+           "bls_series" in funcs and callable(funcs["bls_series"]))
+    if not req:
+        info("sources.py not importable; using CSV as-is.")
+        return df
+
+    frames = []
+    try:
+        wt = funcs["wits_trade_data"]()
+        frames.append(wt)
+        info(f"Refreshed WITS trade rows: {len(wt):,}")
+    except Exception as e:
+        info(f"WITS trade refresh failed: {e}")
+
+    try:
+        tf = funcs["wits_tariff_data"]()
+        frames.append(tf)
+        info(f"Refreshed WITS tariff rows: {len(tf):,}")
+    except Exception as e:
+        info(f"WITS tariff refresh failed: {e}")
+
+    try:
+        imp, exp = funcs["census_monthly_by_country"]()
+        frames.extend([imp, exp])
+        info(f"Refreshed Census imports rows: {len(imp):,} | exports rows: {len(exp):,}")
+    except Exception as e:
+        info(f"Census refresh failed: {e}")
+
+    try:
+        ppi = funcs["bls_series"]("WPUFD4")
+        ppi["source"] = "bls_ppi"
+        frames.append(ppi.rename(columns={"year":"year","period":"period","value":"value"}))
+        info(f"Refreshed BLS rows: {len(ppi):,}")
+    except Exception as e:
+        info(f"BLS refresh failed: {e}")
+
+    if not frames:
+        info("No fresh frames returned; falling back to CSV.")
+        return df
+
+    df_new = pd.concat(frames, ignore_index=True)
+    # Normalize for downstream
+    if "Value" in df_new.columns and "value" not in df_new.columns:
+        df_new = df_new.rename(columns={"Value":"value"})
+    if "time" not in df_new.columns:
+        df_new["time"] = None
+    return df_new
 
 # ----------------------------
 # Time-series utilities
@@ -255,8 +383,8 @@ def _bands_from_resid(resid: np.ndarray, fallback_sd: float) -> Tuple[float,floa
 
 def ets_forecast(ts: pd.Series, h: int=24, seasonal: bool=True):
     """
-    Robust ETS with layered fallbacks. Returns (forecast, lo, hi, scores).
-    Band calibration uses empirical residual quantiles; backtest is last 12 months OOS.
+    Robust ETS with fallbacks. Returns (forecast, lo, hi, scores).
+    Bands from empirical residual quantiles; backtest is last 12 months OOS.
     """
     s = ts.copy()
     if not isinstance(s.index, pd.DatetimeIndex):
@@ -264,7 +392,6 @@ def ets_forecast(ts: pd.Series, h: int=24, seasonal: bool=True):
     s = s.dropna().sort_index()
     if s.index.has_duplicates:
         s = s.groupby(s.index).mean()
-    # Keep monthly frequency, no forward-fill
     s = s.asfreq("M")
     s = s.dropna()
     if len(s) == 0:
@@ -394,7 +521,7 @@ def ai_explain(section_title: str, freq_unit: str,
                extras: Optional[Dict[str,Any]]=None,
                horizons: List[int] = [3,6,12]) -> str:
     """
-    Produces 1–2 short paragraphs (natural language) if AI is enabled.
+    Produces 2 short paragraphs (natural language) if AI is enabled.
     Explains what, how to read, current level & YoY, 3/6/12-month outlook, uncertainty, geopolitics, and takeaway.
     """
     if not (USE_AI and OPENAI_API_KEY):
@@ -414,14 +541,13 @@ def ai_explain(section_title: str, freq_unit: str,
         }
     sys_msg = (
         "You are a senior economist writing for executives. "
-        "Write 2–3 concise paragraphs (10–16 sentences total) in clear business English. "
+        "Write 2 concise paragraphs (8–14 sentences total) in clear business English. "
         "Explain the chart (units/frequency), define acronyms (ETS, PPI), state the latest value and YoY, "
-        "and provide a 3/6/12-month outlook using the forecast points provided explain in deep based on data obtained and geopolitical context. "
-        "Interpret uncertainty bands and Coverage@95, and mention calibration (bands too tight/wide). "
-        "Add light geopolitical/industry context (tariffs, sanctions, energy, logistics, reshoring) without speculation. "
+        "and provide a 3/6/12-month outlook using the forecast points provided. "
+        "Interpret uncertainty bands and Coverage@95, and note calibration (bands too tight/wide). "
+        "Add light geopolitical/supply-chain context (tariffs, sanctions, energy, logistics, reshoring) without speculation. "
         "End with a practical takeaway."
-)
-
+    )
     user_msg = (
         f"Section: {section_title}\n"
         f"Freq/Units: {freq_unit}\n"
@@ -450,7 +576,7 @@ def looks_implausible_partner_mix(grp: pd.DataFrame) -> bool:
     names = set(grp["partner_label"].astype(str).str.upper().head(12))
     big = {"MEXICO","CANADA","CHINA","JAPAN","GERMANY","UNITED KINGDOM","INDIA"}
     has_micro = len(names & SUSPECT_PARTNERS) >= 2
-    missing_big = len(names & big) <= 2  # if we barely see any big partners, be cautious
+    missing_big = len(names & big) <= 2
     return has_micro or missing_big
 
 def partner_top_table(c: pd.DataFrame, source_key: str, top_n: int=8):
@@ -536,10 +662,9 @@ def executive_overview(imports_m: pd.Series, exports_m: pd.Series) -> str:
     text = (
         f"<p><b>Executive overview.</b> U.S. monthly goods imports are currently about <b>{human_usd(last_im)}</b> and exports about "
         f"<b>{human_usd(last_ex)}</b>. Year-over-year, imports are {pct(yoy_im)} and exports are {pct(yoy_ex)}. "
-        "The short-term outlook reflects tariff risks and supply-chain rerouting: a possible near-term dip in targeted imports, "
-        "with partial offsets via sourcing shifts. Export momentum depends on partner demand and the dollar. "
-        "Details and calibrated forecasts (3, 6, 12 months) follow below for each series, with uncertainty bands and scorecards."
-        "</p>"
+        "The short-term outlook reflects tariff risks and supply-chain rerouting—possible near-term dips in targeted categories, "
+        "with offsets via sourcing shifts. Export momentum hinges on partner demand and the dollar. "
+        "Calibrated ETS forecasts with 95% bands and scorecards (sMAPE, WMAPE, RMSE, Coverage@95) follow below.</p>"
     )
 
     if USE_AI and OPENAI_API_KEY:
@@ -561,52 +686,16 @@ def executive_overview(imports_m: pd.Series, exports_m: pd.Series) -> str:
 # Build report
 # ----------------------------
 def build_report():
-    df   = load_main()
+    # 1) Load CSV
+    df = load_main()
+
+    # 2) If stale/incomplete, try on-the-fly refresh (in-memory)
+    df = refresh_if_needed(df)
+
+    # 3) Prepare sources
     wits = prepare_wits(df)
     cen  = prepare_census(df)
     bls  = prepare_bls(df)
-    # ---------- WITS (Annual, up to last available year) ----------
-    if not wits.empty:
-        # pick trade indicators and then world/total
-        wt = wits[wits["indicator"].isin(["MPRT-TRD-VL", "XPRT-TRD-VL"])].copy()
-        wt = wt[
-            (wt["partner_label"].astype(str).str.upper() == "WLD") &
-            (wt["product_label"].astype(str).str.casefold() == "all")
-        ]
-        if not wt.empty:
-            wt["kind"] = np.where(wt["indicator"].eq("MPRT-TRD-VL"), "Imports (Annual)", "Exports (Annual)")
-            g = wt.groupby(["year", "kind"], as_index=False)["value_usd"].sum().dropna()
-            if not g.empty:
-                wide = g.pivot(index="year", columns="kind", values="value_usd").sort_index()
-
-                html.append(h(2, "WITS — Annual Totals (USD)"))
-                html.append(small("Frequency: Annual • Units: USD (converted from WITS 'US$ Million') • Coverage: Goods (nominal)."))
-
-                for col in wide.columns:
-                    ts = wide[col].dropna()
-                    if ts.empty:
-                        continue
-                    ts2 = pd.Series(ts.values, index=pd.to_datetime(ts.index.astype(str) + "-12-31"))
-                    html.append(plot_series(ts2, f"{col} — WITS (Annual)", "USD",
-                                            f"wits_{col.lower().replace(' ', '_')}.png"))
-                    html.append(ai_explain(
-                        section_title=f"{col} — WITS (Annual)",
-                        freq_unit="Annual, USD",
-                        history=ts2, forecast=None,
-                        extras={"source": "WITS (annual, no forward fill)"},
-                        horizons=[3, 6, 12]
-                    ))
-
-                non_empty = wide.dropna(how="all")
-                if not non_empty.empty:
-                    last_year = int(non_empty.index.max())
-                    bullets = []
-                    for col in wide.columns:
-                        val = wide.loc[last_year, col]
-                        if pd.notna(val):
-                            bullets.append(f"{col} in {last_year}: {human_usd(val)}")
-                    if bullets:
-                        html.append(bullet_list(bullets))
 
     html = []
     html.append("<html><head><meta charset='utf-8'><title>U.S. Trade & Supply Chain Report</title>")
@@ -614,7 +703,7 @@ def build_report():
     html.append("</head><body>")
     html.append(h(1, "U.S. Trade & Supply Chain — Executive Report"))
 
-    # Census monthly series (must reach 2025 if update ran correctly)
+    # 4) Compute monthly Census series (should now reach current year)
     imports_m = exports_m = pd.Series(dtype=float)
     if not cen.empty:
         imp_raw = cen[cen["source"].eq("census_imports")].set_index("date")["value_usd"]
@@ -622,9 +711,70 @@ def build_report():
         imports_m = to_monthly_unique(imp_raw, how="sum")
         exports_m = to_monthly_unique(exp_raw, how="sum")
 
-    # Executive overview
+    # 5) Freshness & completeness banner (post-refresh)
+    warn_msgs = []
+    for name, series in [("Imports", imports_m), ("Exports", exports_m)]:
+        if not series.empty:
+            maxdt = pd.to_datetime(series.index.max())
+            if (pd.Timestamp.today().normalize() - maxdt) > pd.Timedelta(days=60):
+                warn_msgs.append(f"{name} latest month is {maxdt.date()} (stale).")
+        else:
+            warn_msgs.append(f"{name} series is empty (no monthly USD rows).")
+    imp_rows = cen[cen["source"].eq("census_imports")].shape[0] if not cen.empty else 0
+    exp_rows = cen[cen["source"].eq("census_exports")].shape[0] if not cen.empty else 0
+    if imp_rows < 5000:
+        warn_msgs.append(f"Imports partner breakdown looks incomplete ({imp_rows:,} rows).")
+    if exp_rows < 5000:
+        warn_msgs.append(f"Exports partner breakdown looks incomplete ({exp_rows:,} rows).")
+    if warn_msgs:
+        html.append(
+            "<div style='background:#fff3cd;border:1px solid #ffeeba;padding:10px;margin:12px 0'>"
+            "<b>Data quality notice:</b> " + " ".join(warn_msgs) +
+            " If unexpected, check the data update logs or rerun the refresh."
+            "</div>"
+        )
+
+    # 6) Executive overview
     html.append(executive_overview(imports_m, exports_m))
 
+    # ---------- WITS (Annual, long-run context; latest years may lag) ----------
+    if not wits.empty:
+        wt = wits[wits["indicator"].isin(["MPRT-TRD-VL", "XPRT-TRD-VL"])].copy()
+        # World + Total (accept both 'all' and 'total'); if empty, fall back to summing across products
+        mask_wld = wt["partner_label"].astype(str).str.upper().isin(["WLD", "WORLD", "ALL COUNTRIES"])
+        mask_prod = wt["product_label"].astype(str).str.lower().isin(["all", "total"])
+        wt2 = wt[mask_wld & mask_prod]
+        if wt2.empty:
+            wt2 = wt[mask_wld].copy()  # sum across products if labels are messy
+        if not wt2.empty:
+            wt2["kind"] = np.where(wt2["indicator"].eq("MPRT-TRD-VL"), "Imports (Annual)", "Exports (Annual)")
+            g = wt2.groupby(["year", "kind"], as_index=False)["value_usd"].sum().dropna()
+            if not g.empty:
+                wide = g.pivot(index="year", columns="kind", values="value_usd").sort_index()
+                html.append(h(2, "WITS — Annual Totals (USD)"))
+                html.append(small("Frequency: Annual • Units: USD • Note: WITS is long-run context; recent years (e.g., 2023+) may be missing."))
+                for col in wide.columns:
+                    ts = wide[col].dropna()
+                    if ts.empty:
+                        continue
+                    ts2 = pd.Series(ts.values, index=pd.to_datetime(ts.index.astype(str) + "-12-31"))
+                    html.append(plot_series(ts2, f"{col} — WITS (Annual)", "USD", f"wits_{col.lower().replace(' ', '_')}.png"))
+                    html.append(ai_explain(
+                        section_title=f"{col} — WITS (Annual)",
+                        freq_unit="Annual, USD",
+                        history=ts2, forecast=None,
+                        extras={"source": "WITS (annual; recent years may be missing)"},
+                        horizons=[3, 6, 12]
+                    ))
+                if not wide.dropna(how="all").empty:
+                    last_year = wide.dropna(how="all").index.max()
+                    bullets = []
+                    for col in wide.columns:
+                        val = wide.loc[last_year, col]
+                        if pd.notna(val):
+                            bullets.append(f"{col} in {int(last_year)}: {human_usd(val)}")
+                    if bullets:
+                        html.append(bullet_list(bullets))
 
     # ---------- Census: Imports (Monthly) ----------
     if not imports_m.empty:
@@ -701,14 +851,15 @@ def build_report():
     # ---------- Methodology & Glossary ----------
     html.append(h(2, "Methodology"))
     html.append(bullet_list([
-        "<b>Sources:</b> WITS (annual, converted from 'US$ Million' to USD), U.S. Census HS timeseries (monthly USD only), BLS PPI (monthly index).",
+        "<b>Sources:</b> WITS (annual, USD), U.S. Census HS timeseries (monthly USD, by partner), BLS PPI (monthly index).",
         "<b>Frequencies:</b> WITS = Annual; Census & BLS = Monthly (nominal). No forward-filling.",
         "<b>Models:</b> ETS/Holt-Winters (additive trend; seasonality=12 when ≥36 months) with fallbacks.",
         "<b>Uncertainty:</b> ≈95% bands from empirical residual quantiles (fallback ±1.96σ).",
         "<b>Backtest:</b> Last 12 months out-of-sample; sMAPE, WMAPE, RMSE, Coverage@95 reported under forecasts.",
         "<b>Partner concentration:</b> Herfindahl-Hirschman Index (HHI) on last-12-month shares.",
         "<b>Sanity checks:</b> Units, last date, non-null %, zeros %, and row counts shown under each chart.",
-        "<b>Data guards:</b> Hide partner tables if micro-economies dominate or major partners are missing; this usually signals a bad pull ('units' or filtered slice)."
+        "<b>Guards:</b> Hide partner tables if micro-economies dominate or major partners are missing; that usually indicates a bad pull (units or filtered slice).",
+        "<b>Freshness:</b> If CSV is stale/incomplete, this script attempts an online refresh from sources.py in-memory."
     ]))
     html.append(h(3, "Glossary"))
     html.append(bullet_list([
@@ -716,7 +867,7 @@ def build_report():
         "<b>sMAPE:</b> Symmetric MAPE — percent error robust when actuals can be near zero.",
         "<b>WMAPE:</b> Weighted MAPE — absolute error over total actuals; interpretable as % of scale.",
         "<b>RMSE:</b> Root Mean Squared Error — typical unit error (e.g., USD).",
-        "<b>Coverage@95:</b> Share of realized points falling inside the nominal 95% forecast band; ≈95% indicates well-calibrated uncertainty.",
+        "<b>Coverage@95:</b> Share of realized points inside the nominal 95% band; ≈95% indicates well-calibrated uncertainty.",
         "<b>HHI:</b> Sum of squared shares × 10,000; higher = more concentrated supplier base."
     ]))
 
